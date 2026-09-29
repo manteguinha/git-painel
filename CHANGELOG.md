@@ -42,3 +42,8 @@ A evolução do Git Painel, na ordem em que as funcionalidades foram criadas.
 - Erros do Git explicados em português.
 - Expandir e recolher tudo.
 - Na primeira execução, pergunta a pasta de projetos.
+
+## 8. Atualização automática (v1.1.0)
+- O app verifica as releases do GitHub ao abrir e a cada 6 horas, em silêncio.
+- Quando há versão nova, aparece uma pílula discreta "Nova versão X" na barra do topo; ao clicar, mostra as notas e atualiza sozinho (baixa, troca o exe e reinicia mantendo as preferências).
+- A versão atual aparece ao lado do nome do app.

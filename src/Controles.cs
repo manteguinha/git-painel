@@ -618,7 +618,11 @@ namespace GitPainel
     {
         public readonly Toggle Filter;
         public string Folder = "";
-        public event EventHandler PickRequested, ReloadRequested;
+        public event EventHandler PickRequested, ReloadRequested, UpdateRequested;
+        // atualização disponível: texto da pílula (null = nada a mostrar) e se está baixando
+        public string UpdateText;
+        public bool UpdateBusy;
+        Rectangle updateRect;
         string hot, pressed;
         Rectangle folderRect, reloadRect, minRect, maxRect, closeRect;
         static readonly Color CloseRed = T.Hex(0xC42B1C);
@@ -632,7 +636,7 @@ namespace GitPainel
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             Height = T.Px(48);
-            foreach (var id in new[] { "folder", "reload", "min", "max", "close" }) lvl[id] = 0;
+            foreach (var id in new[] { "folder", "reload", "min", "max", "close", "update" }) lvl[id] = 0;
             fade.Tick += delegate
             {
                 bool moving = false;
@@ -643,7 +647,7 @@ namespace GitPainel
                     lvl[id] = v;
                 }
                 // o giro do "atualizar" dura pelo menos meio segundo, para não piscar
-                bool spin = refreshing || (DateTime.Now - refreshStart).TotalMilliseconds < 500;
+                bool spin = refreshing || UpdateBusy || (DateTime.Now - refreshStart).TotalMilliseconds < 500;
                 if (!moving && !spin) fade.Stop();
                 Invalidate();
             };
@@ -677,7 +681,12 @@ namespace GitPainel
             string title = "Git Painel";
             int tw = T.Measure(g, title, T.UiBold) + 1;
             T.Text(g, title, T.UiBold, T.Fg, new Rectangle(x, 0, tw, h), 0);
-            x += tw + T.Px(14);
+            x += tw + T.Px(6);
+            // versão, discreta
+            string ver = "v" + Updater.CurrentText;
+            int vw = T.Measure(g, ver, T.Small) + 1;
+            T.Text(g, ver, T.Small, T.Mix(T.Comment, T.Panel, 0.25f), new Rectangle(x, T.Px(2), vw, h), 0);
+            x += vw + T.Px(14);
 
             // pasta atual: só o nome; clicar troca de pasta
             string name = Folder.Length == 0 ? "Escolher pasta" : System.IO.Path.GetFileName(Folder.TrimEnd('\\'));
@@ -694,6 +703,28 @@ namespace GitPainel
                 T.Text(g, G.Down, T.IconSmall, T.Comment, new Rectangle(folderRect.Right - T.Px(18), folderRect.Y, T.Px(10), folderRect.Height), TextFormatFlags.HorizontalCenter);
             }
             else folderRect = Rectangle.Empty;
+
+            // atualização disponível: pílula verde discreta ao lado da pasta
+            updateRect = Rectangle.Empty;
+            if (UpdateText != null)
+            {
+                int ux = (folderRect.Width > 0 ? folderRect.Right : x) + T.Px(8);
+                int utw = T.Measure(g, UpdateText, T.Small) + 1;
+                var ur = new Rectangle(ux, (h - T.Px(26)) / 2, utw + T.Px(34), T.Px(26));
+                if (ur.Right < Filter.Left - T.Px(12))
+                {
+                    updateRect = ur;
+                    float v = UpdateBusy ? 0.25f + 0.1f * T.Pulse : 0.14f + 0.16f * lvl["update"];
+                    T.FillRound(g, T.Mix(T.Panel, T.Green, v), ur, ur.Height / 2f);
+                    if (UpdateBusy)
+                    {
+                        float s = T.Px(11);
+                        T.Spinner(g, new RectangleF(ur.X + T.Px(10), ur.Y + (ur.Height - s) / 2f, s, s), T.Green, T.Px(1.6f));
+                    }
+                    else T.Dot(g, T.Green, ur.X + T.Px(12), ur.Y + (ur.Height - T.Px(7)) / 2f, T.Px(7));
+                    T.Text(g, UpdateText, T.Small, T.Mix(T.Green, T.Fg, 0.25f + 0.5f * lvl["update"]), new Rectangle(ur.X + T.Px(26), ur.Y, utw, ur.Height), 0);
+                }
+            }
 
             // atualizar (gira enquanto a atualização pedida pelo usuário acontece)
             if (lvl["reload"] > 0) T.FillRound(g, T.Mix(T.Panel, T.Line, lvl["reload"]), reloadRect, T.Px(7));
@@ -722,6 +753,14 @@ namespace GitPainel
             T.Text(g, glyph, T.IconSmall, T.Mix(T.Mix(T.Comment, T.Fg, 0.6f), T.Fg, v), r, TextFormatFlags.HorizontalCenter);
         }
 
+        public void SetUpdate(string text, bool busy)
+        {
+            UpdateText = text;
+            UpdateBusy = busy;
+            fade.Start();
+            Invalidate();
+        }
+
         public bool Refreshing
         {
             set
@@ -740,6 +779,7 @@ namespace GitPainel
             if (minRect.Contains(p)) return "min";
             if (reloadRect.Contains(p)) return "reload";
             if (folderRect.Contains(p)) return "folder";
+            if (updateRect.Contains(p) && !UpdateBusy) return "update";
             return null;
         }
 
@@ -759,7 +799,7 @@ namespace GitPainel
         {
             string h = HitTest(e.Location);
             if (h != hot) { hot = h; fade.Start(); }
-            Cursor = h == "folder" || h == "reload" ? Cursors.Hand : Cursors.Default;
+            Cursor = h == "folder" || h == "reload" || h == "update" ? Cursors.Hand : Cursors.Default;
             base.OnMouseMove(e);
         }
 
@@ -785,6 +825,7 @@ namespace GitPainel
                     break;
                 case "reload": if (ReloadRequested != null) ReloadRequested(this, EventArgs.Empty); break;
                 case "folder": if (PickRequested != null) PickRequested(this, EventArgs.Empty); break;
+                case "update": if (UpdateRequested != null) UpdateRequested(this, EventArgs.Empty); break;
             }
         }
     }

@@ -26,6 +26,9 @@ Painel desktop para Windows que mostra, numa tela só, as alterações de **todo
 - Histórico de commits do repositório ou de um módulo, com o diff de cada arquivo.
 - Erros do Git explicados em português.
 
+**Atualização automática**
+- O app avisa discretamente quando há versão nova nas Releases e se atualiza com um clique, mantendo as preferências.
+
 **Integrações**
 - Botão direito: abrir no Explorador de Arquivos, Bloco de Notas ou VS Code; copiar caminho.
 - Duplo clique num arquivo abre no VS Code.
@@ -60,6 +63,12 @@ O app usa o .NET Framework 4.8, que já vem no Windows.
 | Ctrl+C | Copiar o código selecionado (no diff) ou o caminho do arquivo (na lista) |
 | Ctrl+A | Selecionar todo o diff |
 
+## Publicar uma versão nova
+
+1. Suba o número em `src/Tema.cs` (`AssemblyVersion`).
+2. Compile e crie uma release com a tag `v` + número (ex.: `v1.2.0`), anexando o `GitPainel.exe` com esse nome.
+3. Quem já usa o app recebe o aviso em até 6 horas, ou na próxima vez que abrir.
+
 ## Compilar
 
 Não precisa instalar nada: o `compilar.bat` usa o compilador C# que já vem no Windows.
@@ -83,7 +92,8 @@ O `GitPainel.exe` é gerado na mesma pasta.
 | `src/Commit.cs` | Painel de commit |
 | `src/Controles.cs` | Botões, barras, diálogos e rolagem suave |
 | `src/Menu.cs` | Menus do botão direito |
-| `src/MainForm.cs` | Janela principal, atualização automática e operações |
+| `src/Atualizador.cs` | Verificação e instalação de versões novas (Releases do GitHub) |
+| `src/MainForm.cs` | Janela principal, atualização automática da lista e operações |
 
 O histórico de funcionalidades está em [CHANGELOG.md](CHANGELOG.md).
 

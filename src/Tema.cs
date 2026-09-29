@@ -9,6 +9,9 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Git Painel")]
 [assembly: System.Reflection.AssemblyProduct("Git Painel")]
+// versão do app: suba aqui a cada release (a tag no GitHub deve ser v + este número)
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 namespace GitPainel
 {

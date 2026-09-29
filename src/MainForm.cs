@@ -31,6 +31,10 @@ namespace GitPainel
         DateTime lastRefresh = DateTime.MinValue, lastDone, lastFetch = DateTime.Now.AddMinutes(-9.5);
         int diffReq;
         FileChange current; // arquivo cujo diff está na tela (alteração ou histórico)
+        // atualização automática: primeira consulta ~8 s depois de abrir, depois a cada 6 horas
+        Updater.Info update;
+        DateTime lastUpdateCheck = DateTime.Now.AddHours(-6).AddSeconds(8);
+        bool updating, restartAfterClose;
 
         public MainForm(string arg)
         {
@@ -88,6 +92,8 @@ namespace GitPainel
             top.Folder = root ?? "";
             top.PickRequested += delegate { PickFolder(); };
             top.ReloadRequested += delegate { manualRefresh = true; top.Refreshing = true; DoRefresh(); };
+            top.UpdateRequested += delegate { DoUpdate(); };
+            Updater.CleanupOld();
             list.SelectionChanged += delegate { if (list.Selected != null) ShowFile(list.Selected, false); };
 
             header.Mode.Selected = Ini("modo") == "lado" ? 1 : 0;
@@ -605,6 +611,76 @@ namespace GitPainel
             Task.Factory.StartNew(() => { foreach (var r in targets) try { Git.Fetch(r, true); } catch { } });
         }
 
+        // ---------------------------------------------------------- atualização do app
+
+        void CheckUpdate()
+        {
+            lastUpdateCheck = DateTime.Now;
+            RunAsync(() => Updater.Check(), info =>
+            {
+                if (info == null || updating) return;
+                update = info;
+                top.SetUpdate("Nova versão " + Updater.VersionText(info), false);
+            });
+        }
+
+        void DoUpdate()
+        {
+            if (update == null || updating) return;
+            if (opBusy) { status.Flash("Espere a operação em andamento terminar para atualizar o app.", false, null, null); return; }
+            string v = Updater.VersionText(update);
+            string msg = "Você está na versão " + Updater.CurrentText + ". O app baixa a versão " + v +
+                         " do GitHub, reinicia sozinho e mantém suas preferências.";
+            if (commit.Visible && commit.Summary.TextLength > 0)
+                msg += "\n\nA mensagem de commit que você começou a digitar será perdida.";
+            string notes = update.Notes.Trim();
+            if (!MessageDialog.Confirm(this, "Atualizar para a versão " + v + "?", msg, notes.Length > 0 ? notes : null, "Atualizar agora", T.Green)) return;
+
+            updating = true;
+            top.SetUpdate("Baixando…", true);
+            var info = update;
+            string error = null;
+            RunAsync(() =>
+            {
+                try
+                {
+                    return Updater.Download(info, p =>
+                    {
+                        try { BeginInvoke((Action)(() => top.SetUpdate("Baixando… " + p + "%", true))); } catch { }
+                    });
+                }
+                catch (Exception ex) { error = ex.Message; return null; }
+            }, file =>
+            {
+                if (file == null) { UpdateFailed("Não foi possível baixar a atualização", error); return; }
+                top.SetUpdate("Reiniciando…", true);
+                try { Updater.Swap(file); }
+                catch (UnauthorizedAccessException)
+                {
+                    UpdateFailed("Sem permissão para atualizar nesta pasta",
+                        "O Windows não deixou substituir o GitPainel.exe aqui. Baixe a versão nova pela página da release: " + (update.Page ?? ""));
+                    return;
+                }
+                catch (Exception ex) { UpdateFailed("Não foi possível instalar a atualização", ex.Message); return; }
+                restartAfterClose = true;
+                Close();
+            }, () => UpdateFailed("Não foi possível atualizar", error));
+        }
+
+        void UpdateFailed(string title, string detail)
+        {
+            updating = false;
+            top.SetUpdate("Nova versão " + Updater.VersionText(update), false);
+            MessageDialog.Error(this, title, detail ?? "Erro desconhecido.");
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            base.OnFormClosed(e);
+            // abre a versão nova só depois que esta salvou as preferências
+            if (restartAfterClose) try { Updater.Restart(); } catch { }
+        }
+
         // ---------------------------------------------------------- ini
 
         void LoadIni()
@@ -723,6 +799,7 @@ namespace GitPainel
             else if (WindowState != FormWindowState.Minimized && (DateTime.Now - lastRefresh).TotalSeconds > 30)
                 DoRefresh();
             if ((DateTime.Now - lastFetch).TotalMinutes >= 10 && repos.Count > 0) BackgroundFetch();
+            if ((DateTime.Now - lastUpdateCheck).TotalHours >= 6 && !updating) CheckUpdate();
         }
     }
 }
