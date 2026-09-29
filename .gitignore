@@ -1,0 +1,12 @@
+# preferências pessoais de cada usuário (pasta, favoritos, tamanho da janela)
+GitPainel.ini
+
+# executável gerado pelo compilar.bat (publique em Releases do GitHub)
+GitPainel.exe
+*.pdb
+
+# arquivos do sistema e de editores
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
