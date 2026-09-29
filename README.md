@@ -86,3 +86,7 @@ O `GitPainel.exe` é gerado na mesma pasta.
 | `src/MainForm.cs` | Janela principal, atualização automática e operações |
 
 O histórico de funcionalidades está em [CHANGELOG.md](CHANGELOG.md).
+
+## Licença
+
+[MIT](LICENSE): pode usar, modificar e distribuir livremente, mantendo o aviso de copyright.
