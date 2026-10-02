@@ -14,7 +14,7 @@ namespace GitPainel
     {
         public string FullPath, Name, Branch = "", Error, Upstream;
         public int Ahead, Behind;
-        public bool HasHead, Expanded, HasRemote;
+        public bool HasHead, Expanded, HasRemote, Merging; // Merging: merge em andamento (há .git/MERGE_HEAD)
         public List<FileChange> Files = new List<FileChange>();
         public List<ModuleGroup> Modules = new List<ModuleGroup>();
 
@@ -22,6 +22,8 @@ namespace GitPainel
         public bool Flat { get { return Modules.Count == 0 || (Modules.Count == 1 && Modules[0].Path == ""); } }
         // último commit ainda não enviado ao remoto (ou branch sem upstream)
         public bool MaybeLocalHead { get { return HasHead && (Ahead > 0 || Upstream == null); } }
+        // conflitos ainda não resolvidos (arquivo em conflito que ainda tem marcadores <<<<<<< / >>>>>>>)
+        public int Conflicts { get { return Files.Count(f => f.Unmerged && !f.Resolved); } }
     }
 
     // subprojeto dentro do repositório (pasta com package.json, serverless.yml, requirements.txt…)
@@ -42,6 +44,7 @@ namespace GitPainel
         public string Rel, Orig;
         public char Kind;
         public bool Staged, Untracked;
+        public bool Unmerged, Resolved; // em conflito de merge; Resolved = já sem marcadores (falta só concluir)
         // preenchidos só para arquivos de um commit do histórico
         public string Hash, Parent, Short, Subject;
 
@@ -253,12 +256,20 @@ namespace GitPainel
                     f.Rel = p[9]; SetKind(f, p[1]);
                     if (i + 1 < recs.Length) f.Orig = recs[++i];
                 }
-                else if (t == 'u') { var p = s.Split(new[] { ' ' }, 11); if (p.Length < 11) continue; f.Rel = p[10]; f.Kind = '!'; }
+                else if (t == 'u')
+                {
+                    var p = s.Split(new[] { ' ' }, 11); if (p.Length < 11) continue;
+                    f.Rel = p[10];
+                    f.Unmerged = true;
+                    f.Resolved = !HasConflictMarkers(Path.Combine(dir, f.Rel.Replace('/', '\\')));
+                    f.Kind = f.Resolved ? 'M' : '!';
+                }
                 else continue;
                 r.Files.Add(f);
             }
 
             r.HasRemote = HasRemoteConfig(dir);
+            r.Merging = File.Exists(Path.Combine(dir, ".git", "MERGE_HEAD"));
             if (head == "(detached)") r.Branch = "HEAD " + (oid.Length >= 7 ? oid.Substring(0, 7) : oid);
             else r.Branch = head;
             r.Files.Sort((a, b) => string.Compare(a.Rel, b.Rel, StringComparison.OrdinalIgnoreCase));
@@ -274,6 +285,17 @@ namespace GitPainel
                 string cfg = Path.Combine(dir, ".git", "config");
                 if (!File.Exists(cfg)) return true;
                 return File.ReadAllText(cfg).Contains("[remote \"");
+            }
+            catch { return true; }
+        }
+
+        public static bool HasConflictMarkers(string file)
+        {
+            try
+            {
+                if (!File.Exists(file)) return false;
+                string text = File.ReadAllText(file);
+                return Regex.IsMatch(text, @"^<<<<<<< ", RegexOptions.Multiline) && Regex.IsMatch(text, @"^>>>>>>> ", RegexOptions.Multiline);
             }
             catch { return true; }
         }
@@ -707,6 +729,75 @@ namespace GitPainel
             }
             string o = Run(repo.FullPath, args, out code, out err);
             return new GitResult { Ok = code == 0, Output = (o + "\n" + err).Trim() };
+        }
+
+        // ---------------------------------------------------------- branches divergentes (merge)
+
+        public class MergeInfo { public int Ahead; public List<string> Conflicts = new List<string>(); public bool Ok; }
+
+        // conta os commits locais e simula o merge com o remoto sem mexer em nada (git merge-tree)
+        public static MergeInfo PreviewMerge(RepoInfo repo)
+        {
+            var m = new MergeInfo();
+            int ahead;
+            int.TryParse((Out(repo.FullPath, "rev-list --count @{u}..HEAD") ?? "0").Trim(), out ahead);
+            m.Ahead = ahead;
+            int code; string err;
+            string o;
+            try { o = Run(repo.FullPath, "merge-tree --write-tree --name-only HEAD @{u}", out code, out err); }
+            catch { return m; }
+            m.Ok = code == 0 || code == 1;
+            if (code == 1)
+            {
+                // 1ª linha: árvore resultante; depois os arquivos em conflito até a linha em branco
+                var lines = o.Replace("\r", "").Split('\n');
+                for (int i = 1; i < lines.Length && lines[i].Length > 0; i++) m.Conflicts.Add(lines[i]);
+            }
+            return m;
+        }
+
+        public class MergeResult : GitResult { public bool HasConflicts; }
+
+        // junta o remoto com um commit de merge (sem abrir editor)
+        public static MergeResult Merge(RepoInfo repo)
+        {
+            int code; string err;
+            string o = Run(repo.FullPath, "merge --no-edit @{u}", out code, out err);
+            string output = (o + "\n" + err).Trim();
+            bool conflicts = code != 0 && (output.Contains("CONFLICT") || output.Contains("Automatic merge failed"));
+            return new MergeResult { Ok = code == 0, Output = output, HasConflicts = conflicts };
+        }
+
+        public static GitResult AbortMerge(RepoInfo repo)
+        {
+            int code; string err;
+            string o = Run(repo.FullPath, "merge --abort", out code, out err);
+            return new GitResult { Ok = code == 0, Output = (o + "\n" + err).Trim() };
+        }
+
+        // conclui o merge: confere que não sobrou marcador de conflito, marca os arquivos como resolvidos e commita
+        public static GitResult FinishMerge(RepoInfo repo)
+        {
+            var conflicted = repo.Files.Where(f => f.Unmerged).Select(f => f.Rel).ToList();
+            var withMarkers = conflicted.Where(rel => HasConflictMarkers(Path.Combine(repo.FullPath, rel.Replace('/', '\\')))).ToList();
+            if (withMarkers.Count > 0)
+                return GitResult.Fail("Ainda há marcadores de conflito (<<<<<<< / >>>>>>>) nestes arquivos:\n" + string.Join("\n", withMarkers) +
+                                      "\n\nResolva no VS Code, salve e tente concluir de novo.");
+            int code; string err, o;
+            string listFile = Path.GetTempFileName();
+            try
+            {
+                if (conflicted.Count > 0)
+                {
+                    WriteList(listFile, conflicted);
+                    o = Run(repo.FullPath, "--literal-pathspecs add -A --pathspec-from-file=" + Q(listFile) + " --pathspec-file-nul", out code, out err);
+                    if (code != 0) return GitResult.Fail((o + "\n" + err).Trim());
+                }
+                o = Run(repo.FullPath, "commit --no-edit", out code, out err);
+                if (code != 0) return GitResult.Fail((o + "\n" + err).Trim());
+                return new GitResult { Ok = true, Hash = (Out(repo.FullPath, "rev-parse --short HEAD") ?? "").Trim() };
+            }
+            finally { try { File.Delete(listFile); } catch { } }
         }
 
         public static GitResult Fetch(RepoInfo repo, bool quiet)

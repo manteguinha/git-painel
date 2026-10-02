@@ -47,3 +47,9 @@ A evolução do Git Painel, na ordem em que as funcionalidades foram criadas.
 - O app verifica as releases do GitHub ao abrir e a cada 6 horas, em silêncio.
 - Quando há versão nova, aparece uma pílula discreta "Nova versão X" na barra do topo; ao clicar, mostra as notas e atualiza sozinho (baixa, troca o exe e reinicia mantendo as preferências).
 - A versão atual aparece ao lado do nome do app.
+
+## 9. Branches divergentes (v1.2.0)
+- Quando o seu branch e o remoto têm commits novos ao mesmo tempo, o **Atualizar** oferece juntar as versões com um merge (como o "Sync" do VS Code), avisando antes se vai haver conflito e em quais arquivos.
+- O **Enviar** com o remoto à frente traz as novidades primeiro e depois envia, em vez de falhar.
+- Merge com conflito: aviso na linha do repositório, opção de abrir no VS Code, **Concluir merge** (confere que não sobrou marcador de conflito) e **Cancelar o merge**.
+- Commits avulsos ficam bloqueados durante um merge, para não estragá-lo.

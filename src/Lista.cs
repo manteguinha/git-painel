@@ -441,10 +441,17 @@ namespace GitPainel
             if (r.Error == null)
             {
                 if (hot) limit = HoverIcon(g, row, rect, limit, "more", G.More);
+                if (r.Merging)
+                {
+                    // merge em andamento: o que importa agora é resolver os conflitos e concluir
+                    int n = r.Conflicts;
+                    if (n > 0) limit = SyncPill(g, row, rect, limit, "mergefix", G.Warn, n.ToString(), n == 1 ? "conflito no merge" : "conflitos no merge", T.Orange);
+                    else limit = SyncPill(g, row, rect, limit, "mergedone", G.Check, "", "Concluir merge", T.Green);
+                }
                 // sincronização sempre visível quando há algo a fazer
-                if (r.Ahead > 0) limit = SyncPill(g, row, rect, limit, "push", G.Push, r.Ahead.ToString(), "Enviar", T.Green);
+                else if (r.Ahead > 0) limit = SyncPill(g, row, rect, limit, "push", G.Push, r.Ahead.ToString(), "Enviar", T.Green);
                 else if (r.HasHead && r.Upstream == null && r.HasRemote) limit = SyncPill(g, row, rect, limit, "push", G.Push, "", "Publicar", T.Green);
-                if (r.Behind > 0) limit = SyncPill(g, row, rect, limit, "pull", G.Pull, r.Behind.ToString(), "Atualizar", T.Cyan);
+                if (r.Behind > 0 && !r.Merging) limit = SyncPill(g, row, rect, limit, "pull", G.Pull, r.Behind.ToString(), "Atualizar", T.Cyan);
             }
 
             // nome
@@ -464,6 +471,18 @@ namespace GitPainel
             T.Text(g, bt, T.Small, pc, new Rectangle(pr.X + T.Px(8), pr.Y, pr.Width - T.Px(16), pr.Height), 0);
         }
 
+        // opções de um merge com conflitos
+        void ShowMergeMenu(RepoInfo r, Point at)
+        {
+            Func<string, string, bool, string, ToolStripItem> act = (glyph, text, enabled, action) =>
+                OpenMenu.Item(glyph, text, enabled, () => { if (RepoAction != null) RepoAction(r, null, action); });
+            OpenMenu.ShowItems(this, at,
+                act(G.Code, "Resolver os conflitos no VS Code", true, "vscode"),
+                act(G.Check, "Concluir merge", r.Conflicts == 0, "mergedone"),
+                OpenMenu.Separator(),
+                act(G.Undo, "Cancelar o merge (volta ao estado de antes)", true, "abortmerge"));
+        }
+
         // menu do ⋯ e do botão direito em repositório/módulo
         void ShowRepoMenu(RepoInfo r, ModuleGroup m, Point at)
         {
@@ -471,6 +490,13 @@ namespace GitPainel
             Func<string, string, bool, string, ToolStripItem> act = (glyph, text, enabled, action) =>
                 OpenMenu.Item(glyph, text, enabled, () => { if (RepoAction != null) RepoAction(r, m, action); });
             string root = r.FullPath, path = root;
+            if (m == null && r.Merging)
+            {
+                items.Add(act(G.Code, "Resolver os conflitos no VS Code", true, "vscode"));
+                items.Add(act(G.Check, "Concluir merge", r.Conflicts == 0, "mergedone"));
+                items.Add(act(G.Undo, "Cancelar o merge", true, "abortmerge"));
+                items.Add(OpenMenu.Separator());
+            }
             if (m == null)
             {
                 items.Add(act(G.History, "Ver histórico", r.HasHead, "history"));
@@ -480,7 +506,7 @@ namespace GitPainel
                 items.Add(act(G.Pull, r.Behind > 0 ? "Atualizar do remoto  (↓" + r.Behind + ")" : "Buscar e atualizar do remoto (pull)", r.Upstream != null, "pull"));
                 string pushText = r.Upstream == null ? "Publicar branch no remoto (push)"
                     : r.Ahead > 0 ? "Enviar " + r.Ahead + (r.Ahead == 1 ? " commit" : " commits") + " (push)" : "Enviar (push)";
-                items.Add(act(G.Push, pushText, r.HasHead && (r.Ahead > 0 || (r.Upstream == null && r.HasRemote)), "push"));
+                items.Add(act(G.Push, pushText, !r.Merging && r.HasHead && (r.Ahead > 0 || (r.Upstream == null && r.HasRemote)), "push"));
                 items.Add(act(G.Undo, "Desfazer último commit", r.MaybeLocalHead, "undo"));
             }
             else
@@ -686,6 +712,12 @@ namespace GitPainel
             pressedAction = null;
             Invalidate();
             if (!same || repo == null || busyRepo != null || !T.Debounce(ref lastAction, 600)) return;
+            if (a == "mergefix")
+            {
+                var pr = repo.Actions.First(x => x.Value == a).Key;
+                ShowMergeMenu(repo.Repo, new Point(pr.X, pr.Bottom + T.Px(2)));
+                return;
+            }
             if (RepoAction != null) RepoAction(repo.Repo, repo.K == Kind.Module ? repo.Module : null, a);
         }
 

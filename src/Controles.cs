@@ -1048,7 +1048,10 @@ namespace GitPainel
     class MessageDialog : Form
     {
         // primary null = só informativo (um botão "Fechar")
-        public MessageDialog(string title, string message, string detail, string primary, Color accent)
+        public MessageDialog(string title, string message, string detail, string primary, Color accent) : this(title, message, detail, primary, accent, "Cancelar") { }
+
+        // cancelText: texto do botão secundário (ex.: "Agora não" quando "Cancelar" seria ambíguo)
+        public MessageDialog(string title, string message, string detail, string primary, Color accent, string cancelText)
         {
             Text = title;
             BackColor = T.Bg;
@@ -1109,7 +1112,7 @@ namespace GitPainel
             Controls.Add(ok);
             if (primary != null)
             {
-                var cancel = new FlatButton(null, "Cancelar") { Back = T.Bg, Height = T.Px(38), Width = T.Px(120) };
+                var cancel = new FlatButton(null, cancelText) { Back = T.Bg, Height = T.Px(38), Width = T.Px(120) };
                 cancel.Location = new Point(ok.Left - T.Px(10) - cancel.Width, y);
                 cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
                 Controls.Add(cancel);
@@ -1135,6 +1138,11 @@ namespace GitPainel
         }
 
         // erro com explicação em português quando o git devolve uma falha conhecida
+        public static bool Confirm(IWin32Window owner, string title, string message, string detail, string primary, Color accent, string cancelText)
+        {
+            using (var d = new MessageDialog(title, message, detail, primary, accent, cancelText)) return d.ShowDialog(owner) == DialogResult.OK;
+        }
+
         public static void Error(IWin32Window owner, string title, string detail)
         {
             using (var d = new MessageDialog(title, Git.Explain(detail), detail, null, T.Red)) d.ShowDialog(owner);

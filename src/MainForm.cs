@@ -440,6 +440,13 @@ namespace GitPainel
             var repo = list.CheckedRepo;
             var files = list.CheckedFiles;
             if (repo == null || files.Count == 0 || opBusy) return;
+            if (Fresh(repo).Merging)
+            {
+                MessageDialog.Confirm(this, "Há um merge em andamento",
+                    "Enquanto o merge não for concluído ou cancelado, commits avulsos ficam bloqueados neste repositório para não estragar o merge. Use \"Concluir merge\" na linha do repositório.",
+                    null, null, T.Orange);
+                return;
+            }
             var partial = new Dictionary<FileChange, HashSet<int>>();
             var sigs = new Dictionary<FileChange, string>();
             foreach (var f in files)
@@ -478,9 +485,14 @@ namespace GitPainel
             switch (action)
             {
                 case "history": OpenHistory(repo, module != null ? module.Path : null); break;
-                case "pull": DoPull(repo); break;
-                case "push": DoPush(repo); break;
+                case "pull": DoPull(repo, false); break;
+                case "push": DoPush(repo, false); break;
                 case "undo": DoUndo(repo); break;
+                case "mergedone": DoFinishMerge(repo); break;
+                case "abortmerge": DoAbortMerge(repo); break;
+                case "vscode":
+                    if (!OpenMenu.OpenInVsCode(repo.FullPath)) status.Flash("VS Code não encontrado. Abra a pasta " + repo.FullPath + " no seu editor.", false, null, null);
+                    break;
             }
         }
 
@@ -543,8 +555,18 @@ namespace GitPainel
             }, EndOp);
         }
 
-        void DoPush(RepoInfo repo)
+        void DoPush(RepoInfo repo, bool afterPull)
         {
+            if (repo.Merging) { status.Flash("Conclua ou cancele o merge de " + repo.Name + " antes de enviar.", false, null, null); return; }
+            if (!afterPull && repo.Behind > 0 && repo.Upstream != null)
+            {
+                bool go = MessageDialog.Confirm(this, "Traga as novidades antes de enviar",
+                    "O remoto tem " + repo.Behind + (repo.Behind == 1 ? " commit" : " commits") + " que você ainda não tem, então o push seria recusado. " +
+                    "O app traz essas alterações primeiro (juntando com um merge, se precisar) e depois envia os seus commits.",
+                    null, "Atualizar e enviar", T.Cyan);
+                if (go) DoPull(repo, true);
+                return;
+            }
             string sending = repo.Upstream == null ? "Publicando…" : "Enviando…";
             if (!StartOp("Preparando o envio de " + repo.Name + "…", repo, "push", "Preparando…")) return;
             RunAsync(() => Git.OutgoingSummary(repo), outgoing =>
@@ -554,9 +576,6 @@ namespace GitPainel
                 string msg = repo.Upstream != null
                     ? "Os commits abaixo vão de " + repo.Branch + " para " + repo.Upstream + "."
                     : "O branch " + repo.Branch + " ainda não existe no remoto e será publicado.";
-                // o remoto tem commits novos: o push vai ser recusado, melhor avisar antes
-                if (repo.Behind > 0)
-                    msg += "\n\nAtenção: o remoto tem " + repo.Behind + (repo.Behind == 1 ? " commit" : " commits") + " que você ainda não tem. O push provavelmente será recusado; use \"Atualizar\" antes.";
                 if (!MessageDialog.Confirm(this, "Enviar para o remoto (push)?", msg, outgoing, "Enviar (push)", T.Green)) return;
                 if (!StartOp("Enviando " + repo.Name + " para o remoto…", repo, "push", sending)) return;
                 RunAsync(() => Git.Push(repo), res =>
@@ -570,38 +589,119 @@ namespace GitPainel
             }, EndOp);
         }
 
-        void DoPull(RepoInfo repo)
+        void DoPull(RepoInfo repo, bool thenPush)
         {
             if (repo.Upstream == null) { status.Flash(repo.Name + " não tem branch remoto configurado.", false, null, null); return; }
+            if (repo.Merging) { status.Flash("Conclua ou cancele o merge de " + repo.Name + " antes de atualizar.", false, null, null); return; }
             if (!StartOp("Buscando novidades de " + repo.Name + " no remoto…", repo, "pull", "Buscando…")) return;
             string fetchError = null;
+            Git.MergeInfo preview = null;
             RunAsync(() =>
             {
                 var f = Git.Fetch(repo, false);
                 if (!f.Ok) { fetchError = f.Output.Length > 0 ? f.Output : "git fetch falhou sem mensagem."; return null; }
-                return Git.IncomingSummary(repo);
+                string incoming = Git.IncomingSummary(repo);
+                if (incoming.Length > 0) preview = Git.PreviewMerge(repo);
+                return incoming;
             }, incoming =>
             {
                 EndOp();
                 DoRefresh();
                 if (incoming == null) { MessageDialog.Error(this, "Não foi possível buscar do remoto", fetchError); return; }
-                if (incoming.Length == 0) { status.Flash(repo.Name + " já está atualizado com o remoto.", true, null, null); return; }
+                if (incoming.Length == 0)
+                {
+                    if (thenPush) DoPush(repo, true);
+                    else status.Flash(repo.Name + " já está atualizado com o remoto.", true, null, null);
+                    return;
+                }
                 int n = incoming.Split('\n').Length;
+                if (preview != null && preview.Ahead > 0) { ConfirmMerge(repo, incoming, n, preview, thenPush); return; }
+
                 bool ok = MessageDialog.Confirm(this, "Trazer " + n + (n == 1 ? " commit" : " commits") + " do remoto (pull)?",
-                    "O branch " + repo.Branch + " é avançado até " + repo.Upstream + ". Se houver commits locais divergentes ou conflito com arquivos alterados, nada é mudado e o app avisa.",
+                    "O branch " + repo.Branch + " é avançado até " + repo.Upstream + ". Se algum arquivo alterado aqui entrar em conflito, nada é mudado e o app avisa.",
                     incoming, "Atualizar (pull)", T.Cyan);
                 if (!ok || !StartOp("Atualizando " + repo.Name + "…", repo, "pull", "Atualizando…")) return;
                 RunAsync(() => Git.FastForward(repo), res =>
                 {
                     EndOp();
-                    if (res.Ok) status.Flash(repo.Name + " atualizado com o remoto.", true, null, null);
-                    else MessageDialog.Error(this, "O pull não foi concluído", res.Output);
                     if (history.Visible) history.Reload();
                     DoRefresh();
+                    if (!res.Ok) { MessageDialog.Error(this, "O pull não foi concluído", res.Output); return; }
+                    if (thenPush) DoPush(repo, true);
+                    else status.Flash(repo.Name + " atualizado com o remoto.", true, null, null);
                 }, EndOp);
             }, EndOp);
         }
 
+        // os dois lados têm commits novos: junta com merge, avisando antes se vai haver conflito
+        void ConfirmMerge(RepoInfo repo, string incoming, int n, Git.MergeInfo preview, bool thenPush)
+        {
+            string msg = "Seu branch tem " + preview.Ahead + (preview.Ahead == 1 ? " commit que ainda não foi enviado" : " commits que ainda não foram enviados") +
+                         " e o remoto tem " + n + (n == 1 ? " novo" : " novos") + ". Para seguir, o app junta as duas versões com um merge, como o \"Sync\" do VS Code.";
+            if (preview.Conflicts.Count == 0)
+                msg += "\n\nNenhum conflito previsto: os dois lados mexeram em arquivos ou trechos diferentes.";
+            else
+                msg += "\n\nAtenção: " + preview.Conflicts.Count + (preview.Conflicts.Count == 1 ? " arquivo foi alterado" : " arquivos foram alterados") +
+                       " dos dois lados e vai ter conflito. Você resolve no VS Code e conclui pelo app:\n" +
+                       string.Join("\n", preview.Conflicts.Take(8).Select(x => "   • " + x)) + (preview.Conflicts.Count > 8 ? "\n   …" : "");
+            if (!MessageDialog.Confirm(this, "Juntar com o remoto (merge)?", msg, incoming, "Juntar (merge)", T.Cyan)) return;
+            if (!StartOp("Juntando " + repo.Name + " com o remoto…", repo, "pull", "Juntando…")) return;
+            RunAsync(() => Git.Merge(repo), res =>
+            {
+                EndOp();
+                if (history.Visible) history.Reload();
+                DoRefresh();
+                if (res.Ok)
+                {
+                    if (thenPush) DoPush(repo, true);
+                    else status.Flash("Merge de " + repo.Name + " concluído. Agora é só enviar.", true, "Enviar", () => DoPush(Fresh(repo), true));
+                    return;
+                }
+                if (res.HasConflicts)
+                {
+                    bool open = MessageDialog.Confirm(this, "O merge tem conflitos",
+                        "Os arquivos marcados com ! na lista foram alterados dos dois lados. Resolva no VS Code (ele mostra as duas versões lado a lado), salve, " +
+                        "e depois clique em \"Concluir merge\" na linha do repositório. Se preferir desistir, use \"Cancelar o merge\" no menu ⋯.",
+                        res.Output, "Abrir no VS Code", T.Orange, "Agora não");
+                    if (open && !OpenMenu.OpenInVsCode(repo.FullPath)) status.Flash("VS Code não encontrado.", false, null, null);
+                    return;
+                }
+                MessageDialog.Error(this, "O merge não foi feito", res.Output);
+            }, EndOp);
+        }
+
+        void DoFinishMerge(RepoInfo repo)
+        {
+            var r = Fresh(repo);
+            if (!r.Merging) return;
+            if (r.Conflicts > 0) { status.Flash("Ainda há " + r.Conflicts + " arquivo(s) em conflito em " + r.Name + ".", false, null, null); return; }
+            if (!MessageDialog.Confirm(this, "Concluir o merge?",
+                "O commit de merge de " + r.Name + " será criado com a mensagem padrão do Git. Depois é só enviar.", null, "Concluir merge", T.Green)) return;
+            if (!StartOp("Concluindo o merge de " + r.Name + "…", r, "mergedone", "Concluindo…")) return;
+            RunAsync(() => Git.FinishMerge(r), res =>
+            {
+                EndOp();
+                if (history.Visible) history.Reload();
+                DoRefresh();
+                if (res.Ok) status.Flash("Merge de " + r.Name + " concluído (" + res.Hash + "). Agora é só enviar.", true, "Enviar", () => DoPush(Fresh(r), true));
+                else MessageDialog.Error(this, "Não foi possível concluir o merge", res.Output);
+            }, EndOp);
+        }
+
+        void DoAbortMerge(RepoInfo repo)
+        {
+            if (!MessageDialog.Confirm(this, "Cancelar o merge?",
+                "O repositório " + repo.Name + " volta ao estado de antes do merge. Seus commits continuam como estavam; só a junção com o remoto é desfeita.",
+                null, "Cancelar o merge", T.Orange, "Voltar")) return;
+            if (!StartOp("Cancelando o merge de " + repo.Name + "…", repo, "abortmerge", null)) return;
+            RunAsync(() => Git.AbortMerge(repo), res =>
+            {
+                EndOp();
+                DoRefresh();
+                if (res.Ok) status.Flash("Merge de " + repo.Name + " cancelado. Tudo voltou ao estado anterior.", true, null, null);
+                else MessageDialog.Error(this, "Não foi possível cancelar o merge", res.Output);
+            }, EndOp);
+        }
         // busca silenciosa no remoto de tempos em tempos, para os indicadores ↑/↓ ficarem corretos
         void BackgroundFetch()
         {
