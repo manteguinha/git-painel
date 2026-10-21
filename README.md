@@ -22,6 +22,7 @@ Painel desktop para Windows que mostra, numa tela só, as alterações de **todo
 - Marque arquivos, módulos inteiros ou **só alguns trechos** de um arquivo para o commit.
 - Painel de commit compacto, com tipo e escopo no padrão Conventional Commits (com ou sem emoji), detectado a partir do histórico do repositório.
 - Desfazer o último commit ainda não enviado; nada é perdido.
+- **A enviar:** os commits locais que ainda não foram enviados aparecem dentro de cada repositório; abra um commit para ver os arquivos e o diff de cada um.
 - Push e pull com confirmação.
 - Branches divergentes (os dois lados com commits novos): o app oferece juntar com um merge, avisando antes se vai haver conflito; conflitos são resolvidos no VS Code e concluídos (ou cancelados) pelo app.
 - Histórico de commits do repositório ou de um módulo, com o diff de cada arquivo.

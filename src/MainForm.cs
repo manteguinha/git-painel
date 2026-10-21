@@ -323,8 +323,9 @@ namespace GitPainel
             foreach (var n in result)
             {
                 RepoInfo o;
-                if (old.TryGetValue(n.FullPath, out o)) n.Expanded = o.Expanded || (o.Files.Count == 0 && n.Files.Count > 0);
-                else n.Expanded = n.Files.Count > 0 || n.Error != null;
+                // abre sozinho quando passa a ter algo para mostrar (alterações ou commits a enviar)
+                if (old.TryGetValue(n.FullPath, out o)) n.Expanded = o.Expanded || (o.Files.Count == 0 && n.Files.Count > 0) || (o.Outgoing.Count == 0 && n.Outgoing.Count > 0);
+                else n.Expanded = n.Files.Count > 0 || n.Outgoing.Count > 0 || n.Error != null;
             }
 
             // módulos: mantém o que o usuário abriu/fechou; novos abrem se forem "meus" (ou se forem poucos)
@@ -347,9 +348,17 @@ namespace GitPainel
             string key = list.Selected != null ? list.Selected.Key : null;
             list.EmptyText = "Nenhum repositório Git encontrado nesta pasta";
             list.SetRepos(repos);
-            FileChange keep = key == null ? null : repos.SelectMany(x => x.Files).FirstOrDefault(f => f.Key == key);
+            FileChange keep = key == null ? null : list.Find(key);
             list.Select(keep, false);
-            if (keep != null) ShowFile(keep, true);
+            if (keep != null && !keep.FromHistory) ShowFile(keep, true); // arquivo de commit não muda: o diff mostrado continua valendo
+            else if (key != null && current != null && current.FromHistory && current.Key == key)
+            {
+                // o arquivo era de um commit a enviar que já foi enviado (push) ou desfeito
+                current = null;
+                header.Set(null, null);
+                header.SetNote(null);
+                diff.SetData(DiffData.Msg(G.Check, "Este commit não está mais na fila de envio", "Ele foi enviado ao remoto ou desfeito. Veja-o pelo histórico do repositório."), false);
+            }
             else if (key != null && current != null && !current.FromHistory)
             {
                 current = null;
@@ -368,6 +377,8 @@ namespace GitPainel
             string s = Plural(repos.Count, "repositório", "repositórios") + "   ·   " +
                        Plural(total, "arquivo alterado", "arquivos alterados");
             if (list.OnlyMine && list.VisibleFiles != total) s += " (" + list.VisibleFiles + " nos seus módulos)";
+            int outgoing = repos.Sum(x => x.Outgoing.Count);
+            if (outgoing > 0) s += "   ·   " + Plural(outgoing, "commit a enviar", "commits a enviar");
             s += "   ·   atualizado às " + lastDone.ToString("HH:mm:ss");
             status.LeftText = s;
             status.Invalidate();

@@ -53,3 +53,9 @@ A evolução do Git Painel, na ordem em que as funcionalidades foram criadas.
 - O **Enviar** com o remoto à frente traz as novidades primeiro e depois envia, em vez de falhar.
 - Merge com conflito: aviso na linha do repositório, opção de abrir no VS Code, **Concluir merge** (confere que não sobrou marcador de conflito) e **Cancelar o merge**.
 - Commits avulsos ficam bloqueados durante um merge, para não estragá-lo.
+
+## 10. Commits a enviar (v1.3.0)
+- Seção **A enviar** em cada repositório, com os commits locais que o próximo push vai levar ao remoto (ou que ainda não estão em nenhum remoto, se o branch não foi publicado).
+- Cada commit abre para mostrar os arquivos; clicar num arquivo mostra o diff daquele commit.
+- Botão direito no commit: copiar hash ou mensagem, desfazer (o mais recente).
+- Datas dos commits em português ("há 5 min", "ontem, 14:30").

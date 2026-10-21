@@ -9,13 +9,14 @@ namespace GitPainel
 {
     class RepoList : ScrollView
     {
-        enum Kind { Repo, Module, File, Error, Note }
+        enum Kind { Repo, Module, File, Error, Note, Outgoing, Commit, Label }
 
         class Row
         {
             public Kind K;
             public RepoInfo Repo;
             public ModuleGroup Module;
+            public CommitInfo Commit; // commit a enviar (linha do commit ou arquivo dele)
             public FileChange File;
             public List<FileChange> Files; // arquivos visíveis do módulo (respeita a busca)
             public int Y, H, Indent, StarX = -1, StarW;
@@ -52,6 +53,12 @@ namespace GitPainel
         string pressedAction;
         DateTime lastAction;
 
+        // commits a enviar: seção recolhida por repositório, commits abertos e arquivos já lidos (por hash)
+        readonly HashSet<string> outClosed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly HashSet<string> commitOpen = new HashSet<string>();
+        readonly Dictionary<string, List<FileChange>> commitFiles = new Dictionary<string, List<FileChange>>();
+        readonly HashSet<string> commitLoading = new HashSet<string>();
+
         public RepoList()
         {
             BackColor = T.Panel;
@@ -81,11 +88,51 @@ namespace GitPainel
             foreach (var k in Partial.Keys.Where(k => !alive.Contains(k)).ToList()) { Partial.Remove(k); PartialSig.Remove(k); }
             CheckedRepo = CheckedRepo == null ? null : repos.FirstOrDefault(r => r.FullPath == CheckedRepo.FullPath);
             if (SelectedCount == 0) CheckedRepo = null;
+            // esquece commits que já foram enviados ou desfeitos
+            var live = new HashSet<string>(repos.SelectMany(r => r.Outgoing.Select(c => CKey(r, c))));
+            commitOpen.RemoveWhere(h => !live.Contains(h));
+            foreach (var h in commitFiles.Keys.Where(h => !live.Contains(h)).ToList()) commitFiles.Remove(h);
             Build();
             if (CheckChanged != null) CheckChanged(this, EventArgs.Empty);
         }
 
         public void Rebuild() { Build(); }
+
+        // o mesmo commit pode aparecer em dois repositórios (worktree, cópia da pasta)
+        static string CKey(RepoInfo r, CommitInfo c) { return r.FullPath + "|" + c.Hash; }
+
+        // arquivo com essa chave: alteração atual ou arquivo de um commit a enviar (mesmo recolhido)
+        public FileChange Find(string key)
+        {
+            return repos.SelectMany(x => x.Files).FirstOrDefault(f => f.Key == key)
+                ?? commitFiles.Values.SelectMany(l => l).FirstOrDefault(f => f.Key == key);
+        }
+
+        void ToggleCommit(RepoInfo r, CommitInfo c)
+        {
+            string k = CKey(r, c);
+            if (!commitOpen.Remove(k)) commitOpen.Add(k);
+            if (commitOpen.Contains(k) && !commitFiles.ContainsKey(k) && commitLoading.Add(k))
+            {
+                System.Threading.Tasks.Task.Factory.StartNew(() => Git.CommitFiles(r, c)).ContinueWith(t =>
+                {
+                    var res = t.Exception == null ? t.Result : null;
+                    if (IsDisposed || !IsHandleCreated) return;
+                    try
+                    {
+                        BeginInvoke((Action)(() =>
+                        {
+                            commitLoading.Remove(k);
+                            // falhou: fecha o commit para que o próximo clique tente de novo
+                            if (res == null) commitOpen.Remove(k); else commitFiles[k] = res;
+                            Build();
+                        }));
+                    }
+                    catch { }
+                });
+            }
+            Build();
+        }
 
         public string Query
         {
@@ -112,7 +159,11 @@ namespace GitPainel
         // expandir/recolher: todos os repositórios ou só um (e os módulos deles)
         public bool AnyCollapsed
         {
-            get { return repos.Any(r => r.Files.Count > 0 && (!r.Expanded || (!r.Flat && r.Modules.Any(m => !m.Expanded)))); }
+            get
+            {
+                return repos.Any(r => (r.Files.Count > 0 || r.Outgoing.Count > 0) && (!r.Expanded || (!r.Flat && r.Modules.Any(m => !m.Expanded))
+                    || (r.Outgoing.Count > 0 && outClosed.Contains(r.FullPath))));
+            }
         }
 
         public void SetAllExpanded(bool on, RepoInfo only)
@@ -122,6 +173,7 @@ namespace GitPainel
                 if (only != null && r.FullPath != only.FullPath) continue;
                 r.Expanded = on;
                 foreach (var m in r.Modules) m.Expanded = on;
+                if (on) outClosed.Remove(r.FullPath); else outClosed.Add(r.FullPath);
             }
             Build();
         }
@@ -130,7 +182,7 @@ namespace GitPainel
 
         public void FocusFirstFile()
         {
-            var first = rows.FirstOrDefault(r => r.File != null);
+            var first = rows.FirstOrDefault(r => r.File != null && !r.File.FromHistory) ?? rows.FirstOrDefault(r => r.File != null);
             Focus();
             if (first != null && first.File != Selected) Select(first.File, true);
         }
@@ -167,6 +219,36 @@ namespace GitPainel
                 if (r.Expanded || Searching)
                 {
                     if (r.Error != null) { rows.Add(new Row { K = Kind.Error, Repo = r, Y = y, H = T.Px(30) }); y += T.Px(30); }
+                    if (r.Outgoing.Count > 0 && !Searching)
+                    {
+                        rows.Add(new Row { K = Kind.Outgoing, Repo = r, Y = y, H = T.Px(34), Indent = T.Px(20) });
+                        y += T.Px(34);
+                        if (!outClosed.Contains(r.FullPath))
+                            foreach (var c in r.Outgoing)
+                            {
+                                rows.Add(new Row { K = Kind.Commit, Repo = r, Commit = c, Y = y, H = T.Px(30), Indent = T.Px(46) });
+                                y += T.Px(30);
+                                if (!commitOpen.Contains(CKey(r, c))) continue;
+                                List<FileChange> cf;
+                                if (!commitFiles.TryGetValue(CKey(r, c), out cf) || cf.Count == 0)
+                                {
+                                    rows.Add(new Row { K = Kind.Note, Repo = r, Commit = c, Y = y, H = T.Px(26), Indent = T.Px(64), Note = cf == null ? "carregando arquivos…" : "nenhum arquivo alterado neste commit" });
+                                    y += T.Px(26);
+                                    continue;
+                                }
+                                foreach (var f in cf)
+                                {
+                                    rows.Add(new Row { K = Kind.File, Repo = r, Commit = c, File = f, Y = y, H = T.Px(30), Indent = T.Px(64) });
+                                    y += T.Px(30);
+                                }
+                            }
+                        // sem módulos, os arquivos alterados ficariam parecendo parte do último commit
+                        if (r.Flat && count > 0)
+                        {
+                            rows.Add(new Row { K = Kind.Label, Repo = r, Y = y, H = T.Px(28), Indent = T.Px(20), Note = "Alterações" });
+                            y += T.Px(28);
+                        }
+                    }
                     if (r.Flat)
                     {
                         foreach (var kv in modFiles)
@@ -238,7 +320,7 @@ namespace GitPainel
 
         public event EventHandler PartialDropped;
 
-        static bool Checkable(FileChange f) { return !f.Rel.EndsWith("/"); }
+        static bool Checkable(FileChange f) { return !f.FromHistory && !f.Rel.EndsWith("/"); }
 
         int FileState(FileChange f) { return Checked.Contains(f.Key) ? 1 : Partial.ContainsKey(f.Key) ? 2 : 0; }
 
@@ -358,7 +440,17 @@ namespace GitPainel
                     case Kind.Error:
                         T.Text(g, row.Repo.Error, T.Small, T.Red, new Rectangle(rect.X + T.Px(26), rect.Y, rect.Width - T.Px(32), rect.Height), 0);
                         break;
+                    case Kind.Outgoing: PaintOutgoing(g, row, rect, i == hover); break;
+                    case Kind.Commit: PaintCommit(g, row, rect, i == hover); break;
+                    case Kind.Label:
+                        T.Text(g, row.Note, T.SmallBold, T.Comment, new Rectangle(rect.X + row.Indent + T.Px(6), rect.Y + T.Px(4), rect.Width - row.Indent, rect.Height - T.Px(4)), 0);
+                        break;
                     case Kind.Note:
+                        if (row.Commit != null)
+                        {
+                            T.Text(g, row.Note, T.Small, T.Comment, new Rectangle(rect.X + row.Indent, rect.Y, rect.Width - row.Indent, rect.Height), 0);
+                            break;
+                        }
                         if (i == hover) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.35f), rect, T.Px(6));
                         T.Text(g, row.Note, T.Small, i == hover ? T.Mix(T.Comment, T.Fg, 0.4f) : T.Comment,
                             new Rectangle(rect.X + row.Indent + T.Px(4), rect.Y, rect.Width - row.Indent - T.Px(8), rect.Height), 0);
@@ -419,7 +511,7 @@ namespace GitPainel
             row.Actions.Clear();
             if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
             int count = RepoCount(r);
-            bool has = count > 0 || r.Error != null;
+            bool has = count > 0 || r.Error != null || r.Outgoing.Count > 0;
             int x = rect.X + T.Px(4);
             T.Text(g, r.Expanded || Searching ? G.Down : G.Right, T.IconSmall, T.Comment,
                 new Rectangle(x, rect.Y, T.Px(18), rect.Height), TextFormatFlags.HorizontalCenter);
@@ -501,7 +593,7 @@ namespace GitPainel
             {
                 items.Add(act(G.History, "Ver histórico", r.HasHead, "history"));
                 bool open = r.Expanded && (r.Flat || r.Modules.All(x => x.Expanded));
-                items.Add(OpenMenu.Item(open ? G.Up : G.Down, open ? "Recolher tudo neste repositório" : "Expandir tudo neste repositório", r.Files.Count > 0,
+                items.Add(OpenMenu.Item(open ? G.Up : G.Down, open ? "Recolher tudo neste repositório" : "Expandir tudo neste repositório", r.Files.Count > 0 || r.Outgoing.Count > 0,
                     () => SetAllExpanded(!open, r)));
                 items.Add(act(G.Pull, r.Behind > 0 ? "Atualizar do remoto  (↓" + r.Behind + ")" : "Buscar e atualizar do remoto (pull)", r.Upstream != null, "pull"));
                 string pushText = r.Upstream == null ? "Publicar branch no remoto (push)"
@@ -518,6 +610,20 @@ namespace GitPainel
             items.AddRange(OpenMenu.PathItems(path, root, true));
             OpenMenu.ShowItems(this, at, items.ToArray());
         }
+        // botão direito num commit a enviar
+        void ShowCommitMenu(RepoInfo r, CommitInfo c, Point at)
+        {
+            bool last = r.Outgoing.Count > 0 && r.Outgoing[0] == c;
+            bool open = commitOpen.Contains(CKey(r, c));
+            OpenMenu.ShowItems(this, at,
+                OpenMenu.Item(open ? G.Up : G.Down, open ? "Recolher arquivos" : "Ver arquivos", true, () => ToggleCommit(r, c)),
+                OpenMenu.Item(G.Copy, "Copiar hash  (" + c.Short + ")", true, () => { try { Clipboard.SetText(c.Hash); } catch { } }),
+                OpenMenu.Item(G.Copy, "Copiar mensagem", true, () => { try { Clipboard.SetText(c.Subject); } catch { } }),
+                OpenMenu.Separator(),
+                OpenMenu.Item(G.Undo, last ? "Desfazer este commit" : "Desfazer (só o mais recente pode ser desfeito)", last && busyRepo == null,
+                    () => { if (RepoAction != null) RepoAction(r, null, "undo"); }));
+        }
+
         void PaintModule(Graphics g, Row row, Rectangle rect, bool hot)
         {
             var m = row.Module;
@@ -563,6 +669,57 @@ namespace GitPainel
             T.Text(g, last, T.UiBold, m.Path.Length == 0 ? T.Comment : T.Fg, new Rectangle(x + pw, rect.Y, lw, rect.Height), 0);
         }
 
+        // cabeçalho "A enviar": commits locais que o próximo push leva ao remoto
+        void PaintOutgoing(Graphics g, Row row, Rectangle rect, bool hot)
+        {
+            var r = row.Repo;
+            bool open = !outClosed.Contains(r.FullPath);
+            if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.35f), rect, T.Px(6));
+            int x = rect.X + T.Px(6);
+            T.Text(g, open ? G.Down : G.Right, T.IconSmall, T.Comment, new Rectangle(x, rect.Y, T.Px(16), rect.Height), TextFormatFlags.HorizontalCenter);
+            x = rect.X + T.Px(26);
+            T.Text(g, G.Push, T.Icon, T.Green, new Rectangle(x, rect.Y, T.Px(18), rect.Height), TextFormatFlags.HorizontalCenter);
+            x += T.Px(24);
+
+            int n = r.Outgoing.Count;
+            string badge = r.OutgoingMore ? n + "+" : n.ToString();
+            int bh = T.Px(18);
+            int bw = Math.Max(T.Px(24), T.Measure(g, badge, T.SmallBold) + T.Px(12));
+            var brc = new Rectangle(rect.Right - bw - T.Px(8), rect.Y + (rect.Height - bh) / 2, bw, bh);
+            T.FillRound(g, T.Mix(T.Panel, T.Green, 0.14f), brc, bh / 2f);
+            T.Text(g, badge, T.SmallBold, T.Mix(T.Green, T.Fg, 0.2f), brc, TextFormatFlags.HorizontalCenter);
+
+            string label = "A enviar";
+            int lw = Math.Min(T.Measure(g, label, T.UiBold) + 1, brc.X - T.Px(8) - x);
+            T.Text(g, label, T.UiBold, T.Fg, new Rectangle(x, rect.Y, lw, rect.Height), 0);
+            x += lw + T.Px(8);
+            string sub = r.Upstream != null ? "para " + r.Upstream : "branch ainda não publicado";
+            if (brc.X - T.Px(8) - x > T.Px(30))
+                T.Text(g, sub, T.Small, T.Comment, new Rectangle(x, rect.Y + 1, brc.X - T.Px(8) - x, rect.Height), 0);
+        }
+
+        void PaintCommit(Graphics g, Row row, Rectangle rect, bool hot)
+        {
+            var c = row.Commit;
+            bool open = commitOpen.Contains(CKey(row.Repo, c));
+            if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
+            T.Fill(g, T.Mix(T.Panel, T.Line, 0.7f), new Rectangle(rect.X + T.Px(33), rect.Y, Math.Max(1, T.Px(1)), rect.Height));
+            // seta centrada na guia dos arquivos do commit (x + 44), longe da guia da seção (x + 33)
+            T.Text(g, open ? G.Down : G.Right, T.IconSmall, hot ? T.Fg : T.Comment, new Rectangle(rect.X + T.Px(36), rect.Y, T.Px(16), rect.Height), TextFormatFlags.HorizontalCenter);
+            int x = rect.X + row.Indent + T.Px(10);
+            int right = rect.Right - T.Px(8);
+            int ww = T.Measure(g, c.When, T.Small) + 1;
+            if (right - x > ww + T.Px(140))
+            {
+                T.Text(g, c.When, T.Small, T.Comment, new Rectangle(right - ww, rect.Y + 1, ww, rect.Height), 0);
+                right -= ww + T.Px(10);
+            }
+            int hw = T.Measure(g, c.Short, T.MonoSmall) + 1;
+            T.Text(g, c.Short, T.MonoSmall, T.Purple, new Rectangle(x, rect.Y + 1, hw, rect.Height), 0);
+            x += hw + T.Px(8);
+            T.Text(g, c.Subject, T.Ui, T.Fg, new Rectangle(x, rect.Y, Math.Max(0, right - x), rect.Height), 0);
+        }
+
         void PaintFile(Graphics g, Row row, Rectangle rect, bool hot, bool sel)
         {
             var f = row.File;
@@ -574,7 +731,8 @@ namespace GitPainel
             else if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
 
             // guia vertical discreta, como numa árvore: liga o arquivo ao repositório/módulo acima
-            int guide = rect.X + (row.K == Kind.File && row.Module != null && !row.Repo.Flat ? T.Px(33) : T.Px(13));
+            int guide = rect.X + ((row.Module != null && !row.Repo.Flat) || row.Commit != null ? T.Px(33) : T.Px(13));
+            if (row.Commit != null) T.Fill(g, sel ? T.Mix(T.Line, T.Comment, 0.35f) : T.Mix(T.Panel, T.Line, 0.7f), new Rectangle(rect.X + T.Px(44), rect.Y, Math.Max(1, T.Px(1)), rect.Height));
             T.Fill(g, sel ? T.Mix(T.Line, T.Comment, 0.35f) : T.Mix(T.Panel, T.Line, 0.7f), new Rectangle(guide, rect.Y, Math.Max(1, T.Px(1)), rect.Height));
 
             Color sc = T.StatusColor(f.Kind);
@@ -588,7 +746,7 @@ namespace GitPainel
                 right -= T.Px(14);
             }
             HashSet<int> part;
-            if (Partial.TryGetValue(f.Key, out part))
+            if (!f.FromHistory && Partial.TryGetValue(f.Key, out part))
             {
                 string pt = part.Count + (part.Count == 1 ? " trecho" : " trechos");
                 int pw = T.Measure(g, pt, T.Small) + T.Px(14);
@@ -694,8 +852,16 @@ namespace GitPainel
                     else if (e.Clicks > 1) { if (OpenRequested != null) OpenRequested(row.File, EventArgs.Empty); } // duplo clique abre no VS Code
                     else if (row.File != Selected) Select(row.File, true);
                     break;
+                case Kind.Outgoing:
+                    if (e.Clicks > 1) break;
+                    if (!outClosed.Remove(row.Repo.FullPath)) outClosed.Add(row.Repo.FullPath);
+                    Build();
+                    break;
+                case Kind.Commit:
+                    if (e.Clicks == 1) ToggleCommit(row.Repo, row.Commit);
+                    break;
                 case Kind.Note:
-                    if (ShowAllRequested != null) ShowAllRequested(this, EventArgs.Empty);
+                    if (row.Commit == null && ShowAllRequested != null) ShowAllRequested(this, EventArgs.Empty);
                     break;
             }
             hover = HitTest(e.Y);
@@ -741,7 +907,11 @@ namespace GitPainel
                     ShowRepoMenu(row.Repo, row.Module, e.Location);
                     return;
                 case Kind.Repo:
+                case Kind.Outgoing:
                     ShowRepoMenu(row.Repo, null, e.Location);
+                    return;
+                case Kind.Commit:
+                    ShowCommitMenu(row.Repo, row.Commit, e.Location);
                     return;
                 default:
                     return;
@@ -752,7 +922,7 @@ namespace GitPainel
         protected override void OnContentMouseMove(MouseEventArgs e)
         {
             int i = HitTest(e.Y);
-            if (i >= 0 && rows[i].K == Kind.Error) i = -1;
+            if (i >= 0 && (rows[i].K == Kind.Error || rows[i].K == Kind.Label || (rows[i].K == Kind.Note && rows[i].Commit != null))) i = -1;
             string a = i >= 0 ? ActionAt(rows[i], e.X) : null;
             if (i != hover || a != hoverAction) { hover = i; hoverAction = a; Invalidate(); }
             Cursor = i >= 0 ? Cursors.Hand : Cursors.Default;

@@ -17,6 +17,8 @@ namespace GitPainel
         public bool HasHead, Expanded, HasRemote, Merging; // Merging: merge em andamento (há .git/MERGE_HEAD)
         public List<FileChange> Files = new List<FileChange>();
         public List<ModuleGroup> Modules = new List<ModuleGroup>();
+        public List<CommitInfo> Outgoing = new List<CommitInfo>(); // commits locais ainda não enviados (mais recente primeiro)
+        public bool OutgoingMore; // há mais commits a enviar do que os listados
 
         // repositório sem subprojetos: os arquivos aparecem direto, sem nível de módulo
         public bool Flat { get { return Modules.Count == 0 || (Modules.Count == 1 && Modules[0].Path == ""); } }
@@ -49,7 +51,7 @@ namespace GitPainel
         public string Hash, Parent, Short, Subject;
 
         public bool FromHistory { get { return Hash != null; } }
-        public string Key { get { return Repo.FullPath + "|" + Rel; } }
+        public string Key { get { return Repo.FullPath + "|" + (Hash != null ? Hash + "|" : "") + Rel; } }
         string Clean { get { return Rel.TrimEnd('/'); } }
         public string Name { get { int i = Clean.LastIndexOf('/'); return i < 0 ? Clean : Clean.Substring(i + 1); } }
         public string Folder { get { int i = Clean.LastIndexOf('/'); return i < 0 ? "" : Clean.Substring(0, i); } }
@@ -274,6 +276,7 @@ namespace GitPainel
             else r.Branch = head;
             r.Files.Sort((a, b) => string.Compare(a.Rel, b.Rel, StringComparison.OrdinalIgnoreCase));
             GroupModules(r);
+            r.Outgoing = Outgoing(r);
             return r;
         }
 
@@ -597,7 +600,7 @@ namespace GitPainel
         {
             var list = new List<CommitInfo>();
             if (!repo.HasHead) return list;
-            string args = "--literal-pathspecs log --format=%H%x1f%h%x1f%an%x1f%ar%x1f%P%x1f%s%x1e -n " + count + " --skip=" + skip;
+            string args = "--literal-pathspecs log " + LogFormat + " -n " + count + " --skip=" + skip;
             if (!string.IsNullOrEmpty(path)) args += " -- " + Q(path);
             string o = Out(repo.FullPath, args);
             if (o == null) return list;
@@ -606,7 +609,48 @@ namespace GitPainel
             var local = new HashSet<string>();
             string lo = Out(repo.FullPath, "rev-list HEAD --not --remotes --max-count=500");
             if (lo != null) foreach (var h in lo.Split('\n')) if (h.Trim().Length > 0) local.Add(h.Trim());
+            return ParseLog(o, local);
+        }
 
+        public const int OutgoingMax = 50;
+
+        // commits que o push vai enviar; sem upstream, os que não estão em nenhum remoto
+        static List<CommitInfo> Outgoing(RepoInfo r)
+        {
+            if (!r.HasHead) return new List<CommitInfo>();
+            string range;
+            if (r.Upstream != null) { if (r.Ahead == 0) return new List<CommitInfo>(); range = "@{u}..HEAD"; }
+            else if (r.HasRemote) range = "HEAD --not --remotes";
+            else return new List<CommitInfo>(); // repositório só local: tudo seria "a enviar"
+            // lê um a mais só para saber se passou do limite
+            string o = Out(r.FullPath, "log " + LogFormat + " -n " + (OutgoingMax + 1) + " " + range);
+            var list = o == null ? new List<CommitInfo>() : ParseLog(o, null);
+            r.OutgoingMore = list.Count > OutgoingMax;
+            if (r.OutgoingMore) list.RemoveRange(OutgoingMax, list.Count - OutgoingMax);
+            return list;
+        }
+
+        const string LogFormat = "--format=%H%x1f%h%x1f%an%x1f%at%x1f%P%x1f%s%x1e";
+
+        // "há 5 min", "ontem", "há 3 dias"… (o %ar do git sai em inglês)
+        static string Ago(string unix)
+        {
+            long s;
+            if (!long.TryParse(unix.Trim(), out s)) return unix;
+            var when = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(s).ToLocalTime();
+            var d = DateTime.Now - when;
+            if (d.TotalMinutes < 1) return "agora";
+            if (d.TotalMinutes < 60) return "há " + (int)d.TotalMinutes + " min";
+            if (d.TotalHours < 24 && when.Date == DateTime.Today) return "há " + (int)d.TotalHours + (d.TotalHours < 2 ? " hora" : " horas");
+            if (when.Date == DateTime.Today.AddDays(-1)) return "ontem, " + when.ToString("HH:mm");
+            if (d.TotalDays < 7) return "há " + Math.Max(2, (int)Math.Ceiling((DateTime.Today - when.Date).TotalDays)) + " dias";
+            return when.ToString(when.Year == DateTime.Now.Year ? "dd/MM" : "dd/MM/yyyy");
+        }
+
+        // local = null: todos são locais
+        static List<CommitInfo> ParseLog(string o, HashSet<string> local)
+        {
+            var list = new List<CommitInfo>();
             foreach (var rec in o.Split('\x1e'))
             {
                 var p = rec.Trim('\n', '\r').Split('\x1f');
@@ -614,8 +658,8 @@ namespace GitPainel
                 var parents = p[4].Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 list.Add(new CommitInfo
                 {
-                    Hash = p[0], Short = p[1], Author = p[2], When = p[3], Subject = p[5],
-                    Parent = parents.Length > 0 ? parents[0] : null, Local = local.Contains(p[0])
+                    Hash = p[0], Short = p[1], Author = p[2], When = Ago(p[3]), Subject = p[5],
+                    Parent = parents.Length > 0 ? parents[0] : null, Local = local == null || local.Contains(p[0])
                 });
             }
             return list;
