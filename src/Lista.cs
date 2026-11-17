@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -19,9 +19,21 @@ namespace GitPainel
             public CommitInfo Commit; // commit a enviar (linha do commit ou arquivo dele)
             public FileChange File;
             public List<FileChange> Files; // arquivos visíveis do módulo (respeita a busca)
-            public int Y, H, Indent, StarX = -1, StarW;
+            public int Y, H, Indent, StarX = -1, StarW, Index;
             public string Note;
+            public bool Cut; // nome/pasta cortados na pintura: a dica mostra o caminho inteiro
+            public Rectangle StatusRect;
             public List<KeyValuePair<Rectangle, string>> Actions = new List<KeyValuePair<Rectangle, string>>();
+
+            // identidade estável da linha entre reconstruções (hover animado e cursor do teclado)
+            public string Key
+            {
+                get
+                {
+                    return (int)K + "|" + Repo.FullPath + "|" + (Module != null ? Module.Path : "") + "|" +
+                        (Commit != null ? Commit.Hash : "") + "|" + (File != null ? File.Key : "") + "|" + Note;
+                }
+            }
         }
 
         List<RepoInfo> repos = new List<RepoInfo>();
@@ -29,6 +41,33 @@ namespace GitPainel
         int hover = -1;
         string hoverAction;
         string[] terms = new string[0];
+
+        // hover suave: a linha sob o mouse acende e a anterior apaga em ~120ms
+        string hoverKey, fadeKey;
+        float hoverLvl, fadeLvl;
+        readonly Timer fade = new Timer { Interval = 15 };
+        readonly HoverTip tip;
+        // cursor do teclado em linhas que não são arquivo (repositório, módulo, commit)
+        string cursorKey;
+        bool keyboardNav; // o contorno do cursor só aparece enquanto se navega pelo teclado
+
+        float Level(Row r)
+        {
+            if (hoverKey == null && fadeKey == null) return 0;
+            string k = r.Key;
+            return k == hoverKey ? hoverLvl : k == fadeKey ? fadeLvl : 0;
+        }
+
+        void SetHover(int i)
+        {
+            string k = i >= 0 && i < rows.Count ? rows[i].Key : null;
+            if (k == hoverKey) return;
+            fadeKey = hoverKey;
+            fadeLvl = hoverLvl;
+            hoverKey = k;
+            hoverLvl = 0;
+            fade.Start();
+        }
 
         public FileChange Selected { get; private set; }
         public event EventHandler SelectionChanged, StarsChanged, ShowAllRequested, CheckChanged;
@@ -63,7 +102,18 @@ namespace GitPainel
         {
             BackColor = T.Panel;
             spin.Tick += delegate { Invalidate(); };
+            tip = new HoverTip(this);
+            fade.Tick += delegate
+            {
+                hoverLvl = Math.Min(1, hoverLvl + 0.2f);
+                fadeLvl = Math.Max(0, fadeLvl - 0.2f);
+                if (hoverLvl >= 1 && fadeLvl <= 0) { fade.Stop(); fadeKey = null; }
+                Invalidate();
+            };
         }
+
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
 
         public void SetBusy(string repoPath, string action, string label)
         {
@@ -149,8 +199,11 @@ namespace GitPainel
 
         public void Select(FileChange f, bool raise)
         {
+            bool changed = Selected == null || f == null || Selected.Key != f.Key;
             Selected = f;
             var row = rows.FirstOrDefault(r => r.File != null && r.File == f);
+            // o cursor do teclado acompanha a seleção quando ela muda (a atualização automática reseleciona o mesmo arquivo)
+            if (changed && (f != null || cursorKey == null || rows.All(r => r.Key != cursorKey))) cursorKey = row != null ? row.Key : null;
             if (row != null) EnsureVisible(row);
             Invalidate();
             if (raise && SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
@@ -179,6 +232,22 @@ namespace GitPainel
         }
 
         public event EventHandler Rebuilt; // a barra de busca atualiza o ícone de expandir/recolher
+
+        // abre o repositório e o leva para o topo da lista (cartão clicado no resumo)
+        public void Reveal(RepoInfo repo)
+        {
+            var r = repos.FirstOrDefault(x => x.FullPath == repo.FullPath);
+            if (r == null) return;
+            r.Expanded = true;
+            Build();
+            var row = rows.FirstOrDefault(x => x.K == Kind.Repo && x.Repo == r);
+            if (row == null) return;
+            cursorKey = row.Key;
+            keyboardNav = true; // mostra onde o repositório está
+            ScrollToY(row.Y - T.Px(8));
+            Focus();
+            Invalidate();
+        }
 
         public void FocusFirstFile()
         {
@@ -286,6 +355,7 @@ namespace GitPainel
                 }
                 y += T.Px(4);
             }
+            for (int i = 0; i < rows.Count; i++) rows[i].Index = i;
             contentH = y + T.Px(8);
             Reclamp();
             Invalidate();
@@ -425,13 +495,17 @@ namespace GitPainel
             }
             int oy = (int)Math.Round(offY);
             int right = ClientSize.Width - T.Px(8) - (HasV ? T.Px(6) : 0);
-            for (int i = 0; i < rows.Count; i++)
+            // começa direto na primeira linha visível (as linhas estão em ordem de Y)
+            for (int i = Math.Max(0, IndexAtContentY(oy)); i < rows.Count; i++)
             {
                 var row = rows[i];
                 int y = row.Y - oy;
                 if (y + row.H < 0) continue;
                 if (y > ClientSize.Height) break;
                 var rect = new Rectangle(T.Px(8), y, right - T.Px(8), row.H);
+                // cursor do teclado numa linha que não é arquivo: contorno discreto
+                if (Focused && keyboardNav && cursorKey != null && row.File == null && row.Key == cursorKey)
+                    T.StrokeRound(g, T.Mix(T.Panel, T.Purple, 0.7f), new RectangleF(rect.X + 0.5f, rect.Y + 0.5f, rect.Width - 1, rect.Height - 1), T.Px(6), T.Px(1.2f));
                 switch (row.K)
                 {
                     case Kind.Repo: PaintRepo(g, row, rect, i == hover); break;
@@ -451,7 +525,7 @@ namespace GitPainel
                             T.Text(g, row.Note, T.Small, T.Comment, new Rectangle(rect.X + row.Indent, rect.Y, rect.Width - row.Indent, rect.Height), 0);
                             break;
                         }
-                        if (i == hover) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.35f), rect, T.Px(6));
+                        T.RowBackground(g, rect, Level(row) * 0.8f, false, true);
                         T.Text(g, row.Note, T.Small, i == hover ? T.Mix(T.Comment, T.Fg, 0.4f) : T.Comment,
                             new Rectangle(rect.X + row.Indent + T.Px(4), rect.Y, rect.Width - row.Indent - T.Px(8), rect.Height), 0);
                         break;
@@ -463,7 +537,7 @@ namespace GitPainel
         // botão-pílula de sincronização (Enviar / Atualizar / Publicar); devolve o x livre à esquerda
         int SyncPill(Graphics g, Row row, Rectangle rect, int right, string action, string glyph, string count, string label, Color accent)
         {
-            int idx = rows.IndexOf(row);
+            int idx = row.Index;
             bool mine = busyRepo == row.Repo.FullPath && busyAction == action;
             bool blocked = busyRepo != null && !mine;
             bool hot = !blocked && !mine && idx == hover && hoverAction == action;
@@ -498,7 +572,7 @@ namespace GitPainel
         int HoverIcon(Graphics g, Row row, Rectangle rect, int right, string action, string glyph)
         {
             var r = new Rectangle(right - T.Px(26), rect.Y + (rect.Height - T.Px(26)) / 2, T.Px(26), T.Px(26));
-            bool hot = hoverAction == action && rows.IndexOf(row) == hover;
+            bool hot = hoverAction == action && row.Index == hover;
             if (hot) T.FillRound(g, T.Line, r, T.Px(6));
             T.Text(g, glyph, T.Icon, hot ? T.Fg : T.Mix(T.Comment, T.Fg, 0.3f), r, TextFormatFlags.HorizontalCenter);
             row.Actions.Add(new KeyValuePair<Rectangle, string>(r, action));
@@ -509,7 +583,7 @@ namespace GitPainel
         {
             var r = row.Repo;
             row.Actions.Clear();
-            if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
+            T.RowBackground(g, rect, Level(row), false, true);
             int count = RepoCount(r);
             bool has = count > 0 || r.Error != null || r.Outgoing.Count > 0;
             int x = rect.X + T.Px(4);
@@ -628,7 +702,7 @@ namespace GitPainel
         {
             var m = row.Module;
             var files = row.Files ?? m.Files;
-            if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.35f), rect, T.Px(6));
+            T.RowBackground(g, rect, Level(row) * 0.8f, false, true);
             int x = rect.X + T.Px(6);
             T.Text(g, m.Expanded || Searching ? G.Down : G.Right, T.IconSmall, T.Comment,
                 new Rectangle(x, rect.Y, T.Px(16), rect.Height), TextFormatFlags.HorizontalCenter);
@@ -640,16 +714,11 @@ namespace GitPainel
             x += T.Px(24);
 
             // contador
-            string badge = files.Count.ToString();
-            int bh = T.Px(18);
-            int bw = Math.Max(T.Px(24), T.Measure(g, badge, T.SmallBold) + T.Px(12));
-            var brc = new Rectangle(rect.Right - bw - T.Px(8), rect.Y + (rect.Height - bh) / 2, bw, bh);
-            T.FillRound(g, T.Mix(T.Panel, T.Line, 0.6f), brc, bh / 2f);
-            T.Text(g, badge, T.SmallBold, T.Mix(T.Comment, T.Fg, 0.5f), brc, TextFormatFlags.HorizontalCenter);
+            int bw = T.Badge(g, files.Count.ToString(), T.SmallBold, rect.Right - T.Px(8), rect.Y + rect.Height / 2, T.Mix(T.Panel, T.Line, 0.6f), T.Mix(T.Comment, T.Fg, 0.5f));
 
             // estrela: marcada sempre visível; desmarcada só no hover
             row.StarW = T.Px(24);
-            row.StarX = brc.X - T.Px(4) - row.StarW;
+            row.StarX = rect.Right - T.Px(8) - bw - T.Px(4) - row.StarW;
             if (m.Starred || hot)
                 T.Text(g, m.Starred ? G.StarFill : G.Star, T.Icon, m.Starred ? T.Yellow : T.Comment,
                     new Rectangle(row.StarX, rect.Y, row.StarW, rect.Height), TextFormatFlags.HorizontalCenter);
@@ -674,7 +743,7 @@ namespace GitPainel
         {
             var r = row.Repo;
             bool open = !outClosed.Contains(r.FullPath);
-            if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.35f), rect, T.Px(6));
+            T.RowBackground(g, rect, Level(row) * 0.8f, false, true);
             int x = rect.X + T.Px(6);
             T.Text(g, open ? G.Down : G.Right, T.IconSmall, T.Comment, new Rectangle(x, rect.Y, T.Px(16), rect.Height), TextFormatFlags.HorizontalCenter);
             x = rect.X + T.Px(26);
@@ -683,11 +752,8 @@ namespace GitPainel
 
             int n = r.Outgoing.Count;
             string badge = r.OutgoingMore ? n + "+" : n.ToString();
-            int bh = T.Px(18);
-            int bw = Math.Max(T.Px(24), T.Measure(g, badge, T.SmallBold) + T.Px(12));
-            var brc = new Rectangle(rect.Right - bw - T.Px(8), rect.Y + (rect.Height - bh) / 2, bw, bh);
-            T.FillRound(g, T.Mix(T.Panel, T.Green, 0.14f), brc, bh / 2f);
-            T.Text(g, badge, T.SmallBold, T.Mix(T.Green, T.Fg, 0.2f), brc, TextFormatFlags.HorizontalCenter);
+            int bw = T.Badge(g, badge, T.SmallBold, rect.Right - T.Px(8), rect.Y + rect.Height / 2, T.Mix(T.Panel, T.Green, 0.14f), T.Mix(T.Green, T.Fg, 0.2f));
+            var brc = new Rectangle(rect.Right - T.Px(8) - bw, rect.Y, bw, rect.Height);
 
             string label = "A enviar";
             int lw = Math.Min(T.Measure(g, label, T.UiBold) + 1, brc.X - T.Px(8) - x);
@@ -702,8 +768,8 @@ namespace GitPainel
         {
             var c = row.Commit;
             bool open = commitOpen.Contains(CKey(row.Repo, c));
-            if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
-            T.Fill(g, T.Mix(T.Panel, T.Line, 0.7f), new Rectangle(rect.X + T.Px(33), rect.Y, Math.Max(1, T.Px(1)), rect.Height));
+            T.RowBackground(g, rect, Level(row), false, true);
+            T.Fill(g, T.Guide, new Rectangle(rect.X + T.Px(33), rect.Y, Math.Max(1, T.Px(1)), rect.Height));
             // seta centrada na guia dos arquivos do commit (x + 44), longe da guia da seção (x + 33)
             T.Text(g, open ? G.Down : G.Right, T.IconSmall, hot ? T.Fg : T.Comment, new Rectangle(rect.X + T.Px(36), rect.Y, T.Px(16), rect.Height), TextFormatFlags.HorizontalCenter);
             int x = rect.X + row.Indent + T.Px(10);
@@ -723,22 +789,30 @@ namespace GitPainel
         void PaintFile(Graphics g, Row row, Rectangle rect, bool hot, bool sel)
         {
             var f = row.File;
-            if (sel)
-            {
-                T.FillRound(g, T.Line, rect, T.Px(6));
-                T.FillRound(g, T.Purple, new RectangleF(rect.X, rect.Y + T.Px(7), T.Px(3), rect.Height - T.Px(14)), T.Px(1.5f));
-            }
-            else if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
+            T.RowBackground(g, rect, Level(row), sel, Focused);
 
             // guia vertical discreta, como numa árvore: liga o arquivo ao repositório/módulo acima
+            Color gc = sel ? T.Mix(T.Line, T.Comment, 0.35f) : T.Guide;
             int guide = rect.X + ((row.Module != null && !row.Repo.Flat) || row.Commit != null ? T.Px(33) : T.Px(13));
-            if (row.Commit != null) T.Fill(g, sel ? T.Mix(T.Line, T.Comment, 0.35f) : T.Mix(T.Panel, T.Line, 0.7f), new Rectangle(rect.X + T.Px(44), rect.Y, Math.Max(1, T.Px(1)), rect.Height));
-            T.Fill(g, sel ? T.Mix(T.Line, T.Comment, 0.35f) : T.Mix(T.Panel, T.Line, 0.7f), new Rectangle(guide, rect.Y, Math.Max(1, T.Px(1)), rect.Height));
+            if (row.Commit != null) T.Fill(g, gc, new Rectangle(rect.X + T.Px(44), rect.Y, Math.Max(1, T.Px(1)), rect.Height));
+            T.Fill(g, gc, new Rectangle(guide, rect.Y, Math.Max(1, T.Px(1)), rect.Height));
 
             Color sc = T.StatusColor(f.Kind);
             var sr = new Rectangle(rect.Right - T.Px(26), rect.Y, T.Px(18), rect.Height);
+            row.StatusRect = sr;
             T.Text(g, f.Kind.ToString(), T.SmallBold, sc, sr, TextFormatFlags.HorizontalCenter);
             int right = sr.X - T.Px(4);
+
+            // +N −M discreto (mais forte no hover/seleção)
+            if (f.Adds >= 0 && (f.Adds > 0 || f.Dels > 0) && rect.Width > T.Px(240))
+            {
+                float k = sel ? 1f : 0.55f + 0.45f * Level(row);
+                string del = f.Dels > 0 ? "−" + f.Dels : "", add = f.Adds > 0 ? "+" + f.Adds : "";
+                int dw = T.Measure(g, del, T.Small), aw = T.Measure(g, add, T.Small);
+                if (dw > 0) { T.Text(g, del, T.Small, T.Mix(sel ? T.Line : T.Panel, T.Red, k * 0.85f), new Rectangle(right - dw - 1, rect.Y, dw + 1, rect.Height), 0); right -= dw + T.Px(6); }
+                if (aw > 0) { T.Text(g, add, T.Small, T.Mix(sel ? T.Line : T.Panel, T.Green, k * 0.85f), new Rectangle(right - aw - 1, rect.Y, aw + 1, rect.Height), 0); right -= aw + T.Px(6); }
+                right -= T.Px(2);
+            }
             if (f.Staged)
             {
                 float d = T.Px(6);
@@ -758,10 +832,20 @@ namespace GitPainel
 
             if (Checkable(f)) T.Check(g, rect.X + row.Indent - T.Px(22), rect.Y + rect.Height / 2f, FileState(f), hot || sel);
             int x = rect.X + row.Indent;
+
+            // ícone do tipo de arquivo
+            string fg; Color fc;
+            T.FileIcon(f.Rel, out fg, out fc);
+            if (f.Kind == 'D') fc = T.Mix(fc, T.Panel, 0.5f);
+            T.Text(g, fg, T.IconSmall, fc, new Rectangle(x, rect.Y, T.Px(14), rect.Height), TextFormatFlags.HorizontalCenter);
+            x += T.Px(20);
+
             Font nf = f.Kind == 'D' ? T.UiStrike : T.Ui;
             Color nc = f.Kind == 'D' ? T.Comment : T.Fg;
             string name = f.Name;
-            int nw = Math.Min(T.Measure(g, name, nf) + 1, right - x);
+            int full = T.Measure(g, name, nf) + 1;
+            int nw = Math.Min(full, right - x);
+            row.Cut = full > nw;
 
             // realce do termo buscado no nome
             if (Searching)
@@ -779,19 +863,40 @@ namespace GitPainel
             T.Text(g, name, nf, nc, new Rectangle(x, rect.Y, nw, rect.Height), 0);
             x += nw + T.Px(8);
             string folder = f.LocalFolder;
-            if (folder.Length > 0 && right - x > T.Px(24))
-                T.Text(g, folder, T.Small, sel ? T.Mix(T.Comment, T.Fg, 0.25f) : T.Comment,
-                    new Rectangle(x, rect.Y + 1, right - x - T.Px(4), rect.Height), 0);
+            if (folder.Length > 0)
+            {
+                if (right - x > T.Px(24))
+                {
+                    T.Text(g, folder, T.Small, sel ? T.Mix(T.Comment, T.Fg, 0.25f) : T.Comment,
+                        new Rectangle(x, rect.Y + 1, right - x - T.Px(4), rect.Height), 0);
+                    if (T.Measure(g, folder, T.Small) > right - x - T.Px(4)) row.Cut = true;
+                }
+                else row.Cut = true;
+            }
         }
 
         // ---------------------------------------------------------- mouse e teclado
 
+        // linha que contém a coordenada y do conteúdo (busca binária: as linhas estão ordenadas por Y)
+        int IndexAtContentY(int yy)
+        {
+            int lo = 0, hi = rows.Count - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                var r = rows[mid];
+                if (yy < r.Y) hi = mid - 1;
+                else if (yy >= r.Y + r.H) lo = mid + 1;
+                else return mid;
+            }
+            return lo < rows.Count ? lo : -1; // entre linhas: devolve a próxima (para a pintura)
+        }
+
         int HitTest(int y)
         {
             int yy = y + (int)Math.Round(offY);
-            for (int i = 0; i < rows.Count; i++)
-                if (yy >= rows[i].Y && yy < rows[i].Y + rows[i].H) return i;
-            return -1;
+            int i = IndexAtContentY(yy);
+            return i >= 0 && yy >= rows[i].Y && yy < rows[i].Y + rows[i].H ? i : -1;
         }
 
         string ActionAt(Row row, int x)
@@ -806,6 +911,9 @@ namespace GitPainel
             int i = HitTest(e.Y);
             if (i < 0) return;
             var row = rows[i];
+            tip.Clear();
+            keyboardNav = false;
+            if (Navigable(row)) cursorKey = row.Key;
             string action = ActionAt(row, e.X);
             if (action == "more")
             {
@@ -924,13 +1032,143 @@ namespace GitPainel
             int i = HitTest(e.Y);
             if (i >= 0 && (rows[i].K == Kind.Error || rows[i].K == Kind.Label || (rows[i].K == Kind.Note && rows[i].Commit != null))) i = -1;
             string a = i >= 0 ? ActionAt(rows[i], e.X) : null;
-            if (i != hover || a != hoverAction) { hover = i; hoverAction = a; Invalidate(); }
+            if (i != hover || a != hoverAction) { hover = i; hoverAction = a; SetHover(i); Invalidate(); }
             Cursor = i >= 0 ? Cursors.Hand : Cursors.Default;
+            UpdateTip(i, a, e.Location);
         }
 
         protected override void OnContentMouseLeave()
         {
-            if (hover != -1 || hoverAction != null) { hover = -1; hoverAction = null; Invalidate(); }
+            tip.Clear();
+            if (hover != -1 || hoverAction != null) { hover = -1; hoverAction = null; SetHover(-1); Invalidate(); }
+        }
+
+        static string Plural(int n, string one, string many) { return n + " " + (n == 1 ? one : many); }
+
+        // dica do que está sob o mouse: ações, estrela, status, nome cortado, commit
+        void UpdateTip(int i, string action, Point p)
+        {
+            if (i < 0) { tip.Clear(); return; }
+            var row = rows[i];
+            var r = row.Repo;
+            var rect = new Rectangle(T.Px(8), row.Y - (int)Math.Round(offY), ClientSize.Width - T.Px(16), row.H);
+            string text = null;
+            Rectangle area = rect;
+            if (action != null)
+            {
+                foreach (var kv in row.Actions) if (kv.Value == action) area = kv.Key;
+                switch (action)
+                {
+                    case "more": text = "Mais opções do repositório"; break;
+                    case "history": text = "Ver o histórico deste módulo"; break;
+                    case "push":
+                        text = r.Ahead > 0 ? "Enviar " + Plural(r.Ahead, "commit", "commits") + " para " + r.Upstream + "  (push)"
+                            : "Publicar o branch " + r.Branch + " no remoto  (push)";
+                        break;
+                    case "pull": text = "Trazer " + Plural(r.Behind, "commit novo", "commits novos") + " de " + r.Upstream + "  (pull)"; break;
+                    case "mergefix": text = "Opções para resolver o merge"; break;
+                    case "mergedone": text = "Criar o commit que conclui o merge"; break;
+                }
+            }
+            else if (row.K == Kind.File)
+            {
+                var f = row.File;
+                if (row.StatusRect.Contains(p))
+                {
+                    text = T.StatusHint(f.Kind);
+                    if (f.Adds >= 0) text += "  ·  +" + f.Adds + " −" + f.Dels + " linhas";
+                    area = row.StatusRect;
+                }
+                else if (row.Cut) text = f.Rel + (f.Orig != null ? "\nrenomeado de " + f.Orig : "");
+            }
+            else if (row.K == Kind.Module && row.StarX >= 0 && p.X >= row.StarX && p.X < row.StarX + row.StarW)
+            {
+                text = row.Module.Starred ? "Tirar dos meus módulos" : "Marcar como meu módulo (filtro \"Meus módulos\")";
+                area = new Rectangle(row.StarX, rect.Y, row.StarW, rect.Height);
+            }
+            else if (row.K == Kind.Commit)
+            {
+                var c = row.Commit;
+                text = c.Subject + "\n" + c.Short + "  ·  " + c.Author + "  ·  " + c.When;
+            }
+            else if (row.K == Kind.Repo)
+            {
+                text = r.FullPath;
+                if (r.Upstream != null)
+                    text += "\n" + r.Branch + " → " + r.Upstream + (r.Ahead + r.Behind == 0 ? "  (em dia)" :
+                        (r.Ahead > 0 ? "  ·  " + Plural(r.Ahead, "a enviar", "a enviar") : "") + (r.Behind > 0 ? "  ·  " + Plural(r.Behind, "a receber", "a receber") : ""));
+            }
+            tip.Set(text, area);
+        }
+
+        // ---------------------------------------------------------- teclado: navega por todas as linhas
+
+        static bool Navigable(Row r) { return r.K != Kind.Error && r.K != Kind.Label && !(r.K == Kind.Note && r.Commit != null); }
+
+        // profundidade na árvore (← sobe para a linha de nível menor acima)
+        static int Depth(Row r)
+        {
+            switch (r.K)
+            {
+                case Kind.Repo: return 0;
+                case Kind.Commit: return 2;
+                case Kind.File: return r.Commit != null ? 3 : r.Module != null && !r.Repo.Flat ? 2 : 1;
+                case Kind.Note: return r.Commit != null ? 3 : 1;
+                default: return 1;
+            }
+        }
+
+        bool CanToggle(Row r) { return r.K == Kind.Repo || r.K == Kind.Module || r.K == Kind.Outgoing || r.K == Kind.Commit; }
+
+        bool IsOpen(Row r)
+        {
+            switch (r.K)
+            {
+                case Kind.Repo: return r.Repo.Expanded || Searching;
+                case Kind.Module: return r.Module.Expanded || Searching;
+                case Kind.Outgoing: return !outClosed.Contains(r.Repo.FullPath);
+                case Kind.Commit: return commitOpen.Contains(CKey(r.Repo, r.Commit));
+            }
+            return false;
+        }
+
+        void ToggleRow(Row r)
+        {
+            switch (r.K)
+            {
+                case Kind.Repo: if (!Searching) { r.Repo.Expanded = !r.Repo.Expanded; Build(); } break;
+                case Kind.Module: if (!Searching) { r.Module.Expanded = !r.Module.Expanded; Build(); } break;
+                case Kind.Outgoing: if (!outClosed.Remove(r.Repo.FullPath)) outClosed.Add(r.Repo.FullPath); Build(); break;
+                case Kind.Commit: ToggleCommit(r.Repo, r.Commit); break;
+            }
+        }
+
+        int CursorIndex()
+        {
+            if (cursorKey != null)
+                for (int i = 0; i < rows.Count; i++) if (rows[i].Key == cursorKey) return i;
+            if (Selected != null)
+                for (int i = 0; i < rows.Count; i++) if (rows[i].File == Selected) return i;
+            return -1;
+        }
+
+        void MoveCursor(int i)
+        {
+            if (rows.Count == 0) return;
+            i = Math.Max(0, Math.Min(rows.Count - 1, i));
+            var r = rows[i];
+            cursorKey = r.Key;
+            if (r.File != null && r.File != Selected) Select(r.File, true);
+            EnsureVisible(r);
+            Invalidate();
+        }
+
+        // próxima linha navegável a partir de i na direção dir (pula avisos e rótulos)
+        int Step(int i, int dir)
+        {
+            int j = i + dir;
+            while (j >= 0 && j < rows.Count && !Navigable(rows[j])) j += dir;
+            return j >= 0 && j < rows.Count ? j : i;
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
@@ -947,26 +1185,65 @@ namespace GitPainel
                 e.Handled = e.SuppressKeyPress = true;
                 return;
             }
-            if (e.KeyCode == Keys.Space && Selected != null)
+            int cur = CursorIndex();
+            var row = cur >= 0 ? rows[cur] : null;
+            keyboardNav = true;
+            switch (e.KeyCode)
             {
-                ToggleFile(Selected);
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                return;
+                case Keys.Space:
+                    if (row != null && row.K == Kind.Module)
+                    {
+                        var files = row.Files ?? row.Module.Files;
+                        if (CheckState(files) >= 0) SetChecked(files, CheckState(files) != 1);
+                    }
+                    else if (Selected != null) ToggleFile(Selected);
+                    break;
+                case Keys.Up:
+                case Keys.Down:
+                    MoveCursor(cur < 0 ? Step(-1, 1) : Step(cur, e.KeyCode == Keys.Down ? 1 : -1));
+                    break;
+                case Keys.Home: MoveCursor(Step(-1, 1)); break;
+                case Keys.End: MoveCursor(Step(rows.Count, -1)); break;
+                case Keys.PageDown:
+                case Keys.PageUp:
+                    {
+                        int page = Math.Max(1, ClientSize.Height / T.Px(30) - 1), j = Math.Max(0, cur);
+                        for (int k = 0; k < page; k++) j = Step(j, e.KeyCode == Keys.PageDown ? 1 : -1);
+                        MoveCursor(j);
+                        break;
+                    }
+                case Keys.Left:
+                    if (row == null) break;
+                    if (CanToggle(row) && IsOpen(row) && !Searching) ToggleRow(row);
+                    else
+                    {
+                        int d = Depth(row);
+                        for (int j = cur - 1; j >= 0; j--) if (Navigable(rows[j]) && Depth(rows[j]) < d && CanToggle(rows[j])) { MoveCursor(j); break; }
+                    }
+                    break;
+                case Keys.Right:
+                    if (row == null) break;
+                    if (CanToggle(row) && !IsOpen(row)) ToggleRow(row);
+                    else if (CanToggle(row)) MoveCursor(Step(cur, 1));
+                    break;
+                case Keys.Enter:
+                    if (row == null) break;
+                    if (row.File != null) { if (OpenRequested != null) OpenRequested(row.File, EventArgs.Empty); }
+                    else if (CanToggle(row)) ToggleRow(row);
+                    else if (row.K == Kind.Note && ShowAllRequested != null) ShowAllRequested(this, EventArgs.Empty);
+                    break;
+                default:
+                    base.OnKeyDown(e);
+                    return;
             }
-            if (e.KeyCode == Keys.Up || e.KeyCode == Keys.Down)
-            {
-                var files = rows.Where(r => r.File != null).ToList();
-                if (files.Count > 0)
-                {
-                    int idx = files.FindIndex(r => r.File == Selected);
-                    int next = idx < 0 ? 0 : Math.Max(0, Math.Min(files.Count - 1, idx + (e.KeyCode == Keys.Down ? 1 : -1)));
-                    if (files[next].File != Selected) Select(files[next].File, true);
-                }
-                e.Handled = true;
-                return;
-            }
-            base.OnKeyDown(e);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+
+        protected override bool IsInputKey(Keys k)
+        {
+            if ((k & Keys.KeyCode) == Keys.Enter || (k & Keys.KeyCode) == Keys.Space) return true;
+            return base.IsInputKey(k);
         }
     }
 }

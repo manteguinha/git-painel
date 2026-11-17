@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace GitPainel
@@ -18,11 +19,26 @@ namespace GitPainel
         int numW, cols, hoverHunk = -1;
         // linhas visuais: índice da linha (ou da linha lado a lado) + qual pedaço dela
         readonly List<int> vSrc = new List<int>(), vPart = new List<int>();
+        // linha lógica -> primeira linha visual (âncora, busca e navegação sem varrer tudo)
+        readonly Dictionary<DiffLine, int> visualOf = new Dictionary<DiffLine, int>();
+        // blocos de alteração: [início, fim) em linhas visuais e o tipo (1 só adição, 2 só remoção, 3 os dois)
+        readonly List<int[]> blocks = new List<int[]>();
 
         // seleção de trechos para commit
-        bool hunksOn;
+        bool hunksOn, partialNow;
         int[] hunkStates;
         public event Action<int> HunkToggled;
+
+        // linhas ocultas entre trechos (clicar mostra mais contexto)
+        readonly Dictionary<DiffLine, int> hiddenBefore = new Dictionary<DiffLine, int>();
+        readonly List<KeyValuePair<Rectangle, DiffLine>> gapRects = new List<KeyValuePair<Rectangle, DiffLine>>();
+        DiffLine hoverGap;
+        public event EventHandler ExpandRequested, ShowAllRequested, NavChanged, FindChanged;
+        Rectangle moreRect;
+        bool hoverMore;
+        int keptLines; // linhas de código mostradas de um diff truncado
+
+        static readonly Regex HunkHead = new Regex(@"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", RegexOptions.Compiled);
 
         public DiffView()
         {
@@ -33,6 +49,13 @@ namespace GitPainel
             signW = T.Px(22);
             topPad = T.Px(8);
             data = DiffData.Msg(G.Doc, "Selecione um arquivo", "Escolha um arquivo alterado na lista ao lado para ver o diff.");
+            loadTimer.Tick += delegate
+            {
+                if (!loading) { loadTimer.Stop(); return; }
+                if (!loadShown && (DateTime.Now - loadStart).TotalMilliseconds > 160) loadShown = true;
+                if (loadShown) Invalidate();
+            };
+            relayoutTimer.Tick += delegate { relayoutTimer.Stop(); KeepAnchor(() => { }, false); };
         }
 
         public DiffData Data { get { return data; } }
@@ -54,11 +77,11 @@ namespace GitPainel
         {
             hunksOn = enabled && data.Title == null && data.HunkCount > 0;
             hunkStates = states;
+            partialNow = hunkStates != null && hunkStates.Any(s => s == 1) && hunkStates.Any(s => s == 0);
             Invalidate();
         }
 
-        bool Partial { get { return hunkStates != null && hunkStates.Any(s => s == 1) && hunkStates.Any(s => s == 0); } }
-        bool Dim(DiffLine l) { return hunksOn && Partial && l.HunkIdx >= 0 && l.HunkIdx < hunkStates.Length && hunkStates[l.HunkIdx] == 0; }
+        bool Dim(DiffLine l) { return partialNow && hunksOn && l.HunkIdx >= 0 && l.HunkIdx < hunkStates.Length && hunkStates[l.HunkIdx] == 0; }
 
         protected override int WheelStep { get { return lineH * 3; } }
         int Gutter { get { return 2 * numW + signW; } }
@@ -74,12 +97,36 @@ namespace GitPainel
             float oy = offY, ox = offX;
             data = d;
             if (!keepScroll) ClearSel();
-            hunksOn = false;
+            hunksOn = partialNow = false;
             hunkStates = null;
             hoverHunk = -1;
+            hoverGap = null;
+            keptLines = d.Truncated > 0 ? d.Lines.Count(l => l.K != DiffLine.Hunk) : 0;
             BuildSide();
             Relayout();
             if (keepScroll) JumpTo(oy, ox); else JumpTo(0, 0);
+            RunFind(keepScroll);
+            if (NavChanged != null) NavChanged(this, EventArgs.Empty);
+        }
+
+        // ---------------------------------------------------------- carregando
+
+        bool loading, loadShown;
+        DateTime loadStart;
+        readonly Timer loadTimer = new Timer { Interval = 30 };
+
+        // o diff anterior fica esmaecido com um indicador enquanto o novo carrega (só se demorar)
+        public bool Loading
+        {
+            get { return loading; }
+            set
+            {
+                if (loading == value) return;
+                loading = value;
+                loadShown = false;
+                loadStart = DateTime.Now;
+                if (value) loadTimer.Start(); else { loadTimer.Stop(); Invalidate(); }
+            }
         }
 
         // mantém no topo a mesma linha do arquivo quando o layout muda (quebra, modo, largura)
@@ -95,31 +142,28 @@ namespace GitPainel
 
         void JumpToAnchor(DiffLine anchor)
         {
-            if (anchor == null) { JumpTo(offY, 0); return; }
-            for (int i = 0; i < vSrc.Count; i++)
-            {
-                if (vPart[i] != 0) continue;
-                bool hit;
-                if (!layoutSide) hit = data.Lines[vSrc[i]] == anchor;
-                else { var r = side[vSrc[i]]; hit = r.L == anchor || r.R == anchor || r.Hunk == anchor; }
-                if (hit) { JumpTo(topPad + i * lineH, 0); return; }
-            }
-            JumpTo(offY, 0);
+            int i;
+            if (anchor != null && visualOf.TryGetValue(anchor, out i)) JumpTo(topPad + i * lineH, 0);
+            else JumpTo(offY, 0);
         }
 
-        void KeepAnchor(Action change)
+        void KeepAnchor(Action change) { KeepAnchor(change, true); }
+
+        // clear = false: só a largura mudou; a seleção (linha, caractere) continua válida
+        void KeepAnchor(Action change, bool clear)
         {
-            ClearSel();
+            if (clear) ClearSel();
             var a = TopLine();
             change();
             Relayout();
             JumpToAnchor(a);
         }
 
-        // pareia remoções e adições consecutivas (lado a lado) e marca o trecho que mudou em cada par
+        // pareia remoções e adições consecutivas (lado a lado) e marca o que mudou em cada par
         void BuildSide()
         {
             side = new List<SideRow>();
+            hiddenBefore.Clear();
             var dels = new List<DiffLine>();
             var adds = new List<DiffLine>();
             Action flush = () =>
@@ -129,12 +173,13 @@ namespace GitPainel
                 {
                     var l = i < dels.Count ? dels[i] : null;
                     var r = i < adds.Count ? adds[i] : null;
-                    if (l != null && r != null) MarkChange(l, r);
+                    if (l != null && r != null && l.Chg == null && r.Chg == null) MarkChange(l, r);
                     side.Add(new SideRow { L = l, R = r });
                 }
                 dels.Clear();
                 adds.Clear();
             };
+            int expected = 1; // próxima linha (do arquivo novo) que ainda não apareceu
             foreach (var l in data.Lines)
             {
                 if (l.K == DiffLine.Del) { if (adds.Count > 0) flush(); dels.Add(l); }
@@ -142,24 +187,104 @@ namespace GitPainel
                 else
                 {
                     flush();
-                    if (l.K == DiffLine.Hunk) side.Add(new SideRow { Hunk = l });
+                    if (l.K == DiffLine.Hunk)
+                    {
+                        side.Add(new SideRow { Hunk = l });
+                        var m = HunkHead.Match(l.Text);
+                        if (m.Success)
+                        {
+                            int c = int.Parse(m.Groups[3].Value), n = m.Groups[4].Success ? int.Parse(m.Groups[4].Value) : 1;
+                            int start = n == 0 ? c + 1 : c;
+                            if (start - expected > 0) hiddenBefore[l] = start - expected;
+                            expected = start + n;
+                        }
+                    }
                     else side.Add(new SideRow { L = l, R = l });
                 }
             }
             flush();
         }
 
+        // realce de palavras: diff por tokens (palavras, espaços e símbolos) entre a linha removida e a adicionada
         static void MarkChange(DiffLine a, DiffLine b)
+        {
+            string x = a.Text, y = b.Text;
+            var tx = Tokens(x);
+            var ty = Tokens(y);
+            int n = tx.Count, m = ty.Count;
+            if (n == 0 || m == 0 || (long)n * m > 60000) { MarkPrefixSuffix(a, b); return; }
+
+            // LCS por programação dinâmica (linhas de código têm poucos tokens)
+            var dp = new int[n + 1, m + 1];
+            for (int i = n - 1; i >= 0; i--)
+                for (int j = m - 1; j >= 0; j--)
+                    dp[i, j] = Same(x, tx[i], y, ty[j]) ? dp[i + 1, j + 1] + 1 : Math.Max(dp[i + 1, j], dp[i, j + 1]);
+            var kx = new bool[n];
+            var ky = new bool[m];
+            int p = 0, q = 0, keep = 0;
+            while (p < n && q < m)
+            {
+                if (Same(x, tx[p], y, ty[q])) { kx[p] = true; ky[q] = true; keep += tx[p][1]; p++; q++; }
+                else if (dp[p + 1, q] >= dp[p, q + 1]) p++;
+                else q++;
+            }
+            // linhas quase totalmente diferentes: realçar tudo não ajuda
+            if (keep * 10 < Math.Max(x.Length, y.Length) * 3) return;
+            a.Chg = Ranges(tx, kx, x);
+            b.Chg = Ranges(ty, ky, y);
+        }
+
+        static bool Same(string x, int[] a, string y, int[] b)
+        {
+            return a[1] == b[1] && string.CompareOrdinal(x, a[0], y, b[0], a[1]) == 0;
+        }
+
+        static List<int[]> Tokens(string s)
+        {
+            var list = new List<int[]>();
+            int i = 0;
+            while (i < s.Length)
+            {
+                int st = i;
+                char c = s[i];
+                if (char.IsLetterOrDigit(c) || c == '_') { while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++; }
+                else if (char.IsWhiteSpace(c)) { while (i < s.Length && char.IsWhiteSpace(s[i])) i++; }
+                else i++;
+                list.Add(new[] { st, i - st });
+            }
+            return list;
+        }
+
+        // tokens não preservados viram faixas; espaço entre duas faixas é absorvido para não picotar o realce
+        static int[] Ranges(List<int[]> tok, bool[] kept, string s)
+        {
+            var r = new List<int>();
+            for (int i = 0; i < tok.Count; i++)
+            {
+                if (kept[i]) continue;
+                int st = tok[i][0], en = st + tok[i][1];
+                if (r.Count > 0)
+                {
+                    int last = r[r.Count - 1];
+                    bool onlySpace = true;
+                    for (int k = last; k < st; k++) if (!char.IsWhiteSpace(s[k])) { onlySpace = false; break; }
+                    if (onlySpace) { r[r.Count - 1] = en; continue; }
+                }
+                r.Add(st); r.Add(en);
+            }
+            return r.Count == 0 ? null : r.ToArray();
+        }
+
+        static void MarkPrefixSuffix(DiffLine a, DiffLine b)
         {
             string x = a.Text, y = b.Text;
             int max = Math.Min(x.Length, y.Length), p = 0, s = 0;
             while (p < max && x[p] == y[p]) p++;
             while (s < max - p && x[x.Length - 1 - s] == y[y.Length - 1 - s]) s++;
             int longer = Math.Max(x.Length, y.Length);
-            // linhas muito diferentes: realçar tudo não ajuda
             if (longer == 0 || (p + s) * 10 < longer * 3) return;
-            if (x.Length - s > p) { a.ChgS = p; a.ChgE = x.Length - s; }
-            if (y.Length - s > p) { b.ChgS = p; b.ChgE = y.Length - s; }
+            if (x.Length - s > p) a.Chg = new[] { p, x.Length - s };
+            if (y.Length - s > p) b.Chg = new[] { p, y.Length - s };
         }
 
         // quebra em pedaços de até "cols" caracteres, preferindo cortar depois de um espaço
@@ -186,6 +311,8 @@ namespace GitPainel
             return l.Wrap.Length;
         }
 
+        static bool IsChange(DiffLine l) { return l != null && (l.K == DiffLine.Add || l.K == DiffLine.Del); }
+
         void Relayout()
         {
             layoutSide = sideBySide && ClientSize.Width >= T.Px(760);
@@ -196,25 +323,56 @@ namespace GitPainel
 
             vSrc.Clear();
             vPart.Clear();
+            visualOf.Clear();
+            blocks.Clear();
+            navIdx = -1;
             int count = layoutSide ? side.Count : data.Lines.Count;
+            int[] open = null;
             for (int i = 0; i < count; i++)
             {
-                int n = layoutSide
-                    ? (side[i].Hunk != null ? 1 : Math.Max(Parts(side[i].L), side[i].L == side[i].R ? 1 : Parts(side[i].R)))
-                    : Parts(data.Lines[i]);
+                int n;
+                int kind = 0;
+                if (layoutSide)
+                {
+                    var r = side[i];
+                    n = r.Hunk != null ? 1 : Math.Max(Parts(r.L), r.L == r.R ? 1 : Parts(r.R));
+                    if (r.Hunk != null) visualOf[r.Hunk] = vSrc.Count;
+                    if (r.L != null && !visualOf.ContainsKey(r.L)) visualOf[r.L] = vSrc.Count;
+                    if (r.R != null && !visualOf.ContainsKey(r.R)) visualOf[r.R] = vSrc.Count;
+                    if (IsChange(r.L) && r.L.K == DiffLine.Del) kind |= 2;
+                    if (IsChange(r.R) && r.R.K == DiffLine.Add) kind |= 1;
+                }
+                else
+                {
+                    var l = data.Lines[i];
+                    n = Parts(l);
+                    visualOf[l] = vSrc.Count;
+                    if (l.K == DiffLine.Add) kind = 1; else if (l.K == DiffLine.Del) kind = 2;
+                }
+                if (kind != 0)
+                {
+                    if (open == null) { open = new[] { vSrc.Count, vSrc.Count + n, kind }; blocks.Add(open); }
+                    else { open[1] = vSrc.Count + n; open[2] |= kind; }
+                }
+                else open = null;
                 for (int p = 0; p < n; p++) { vSrc.Add(i); vPart.Add(p); }
             }
-            contentH = vSrc.Count == 0 ? 0 : vSrc.Count * lineH + topPad * 2;
+            int extra = data.Truncated > 0 ? 3 * lineH : 0;
+            contentH = vSrc.Count == 0 ? 0 : vSrc.Count * lineH + topPad * 2 + extra;
             contentW = wrap ? 0 : data.MaxLen * charW + T.Px(40);
             Reclamp();
             Invalidate();
         }
 
         int lastW;
+        readonly Timer relayoutTimer = new Timer { Interval = 70 };
+
         protected override void OnResize(EventArgs e)
         {
             bool sideNow = sideBySide && ClientSize.Width >= T.Px(760);
-            if (data != null && ((wrap && ClientSize.Width != lastW) || sideNow != layoutSide)) KeepAnchor(() => { });
+            if (data != null && sideNow != layoutSide) { relayoutTimer.Stop(); KeepAnchor(() => { }); }
+            // com quebra de linha, refazer o layout a cada pixel do arraste do divisor é caro: espera parar
+            else if (data != null && wrap && ClientSize.Width != lastW) { relayoutTimer.Stop(); relayoutTimer.Start(); }
             lastW = ClientSize.Width;
             base.OnResize(e);
         }
@@ -234,6 +392,145 @@ namespace GitPainel
             base.OnKeyDown(e);
         }
 
+        // ---------------------------------------------------------- navegação entre alterações
+
+        public int ChangeCount { get { return blocks.Count; } }
+
+        // linha de referência: um terço abaixo do topo, onde a navegação posiciona cada bloco
+        int RefLine { get { return (int)Math.Floor((TargetY + ClientSize.Height / 3f - topPad) / lineH + 0.01f); } }
+
+        // bloco escolhido pela navegação: perto do fim do arquivo a rolagem não alcança "um terço da tela",
+        // então o índice é lembrado enquanto a posição não mudar por outro motivo
+        int navIdx = -1;
+        float navY = -1;
+        bool NavValid { get { return navIdx >= 0 && navIdx < blocks.Count && Math.Abs(navY - TargetY) < 1; } }
+
+        // nº (1..N) do bloco em que o leitor está; 0 = antes do primeiro
+        public int CurrentChange
+        {
+            get
+            {
+                if (NavValid) return navIdx + 1;
+                int r = RefLine, c = 0;
+                foreach (var b in blocks) { if (b[0] <= r) c++; else break; }
+                return c;
+            }
+        }
+
+        public bool NextChange(int dir)
+        {
+            if (blocks.Count == 0 || data.Title != null) return false;
+            int t;
+            if (NavValid) t = navIdx + (dir > 0 ? 1 : -1);
+            else
+            {
+                int r = RefLine;
+                t = dir > 0 ? blocks.FindIndex(b => b[0] > r) : blocks.FindLastIndex(b => b[0] < r);
+            }
+            if (t < 0 || t >= blocks.Count) return false;
+            CenterVisual(blocks[t][0]);
+            navIdx = t;
+            navY = TargetY;
+            if (NavChanged != null) NavChanged(this, EventArgs.Empty);
+            return true;
+        }
+
+        void CenterVisual(int idx)
+        {
+            ScrollToY(topPad + idx * lineH - ClientSize.Height / 3f);
+        }
+
+        protected override void OnScrolled() { if (NavChanged != null) NavChanged(this, EventArgs.Empty); }
+
+        // ---------------------------------------------------------- busca no diff
+
+        class Hit { public DiffLine L; public int S; }
+        readonly List<Hit> hits = new List<Hit>();
+        readonly Dictionary<DiffLine, List<int>> hitMap = new Dictionary<DiffLine, List<int>>();
+        string findQ = "";
+        int findCur = -1;
+
+        public int FindCount { get { return hits.Count; } }
+        public int FindIndex { get { return findCur; } }
+        public string FindQuery { get { return findQ; } }
+
+        public void SetFind(string q)
+        {
+            findQ = q ?? "";
+            findCur = -1;
+            RunFind(false);
+            if (hits.Count > 0) GoToHit(FirstHitFromView());
+            Invalidate();
+        }
+
+        // recalcula as ocorrências (texto novo); keep tenta manter a ocorrência atual
+        void RunFind(bool keep)
+        {
+            int prev = findCur;
+            hits.Clear();
+            hitMap.Clear();
+            findCur = -1;
+            if (findQ.Length > 0 && data.Title == null)
+            {
+                foreach (var l in data.Lines)
+                {
+                    if (l.K == DiffLine.Hunk || l.K == DiffLine.Meta || string.IsNullOrEmpty(l.Text)) continue;
+                    int at = 0;
+                    while ((at = l.Text.IndexOf(findQ, at, StringComparison.OrdinalIgnoreCase)) >= 0)
+                    {
+                        hits.Add(new Hit { L = l, S = at });
+                        List<int> lst;
+                        if (!hitMap.TryGetValue(l, out lst)) hitMap[l] = lst = new List<int>();
+                        lst.Add(at);
+                        at += Math.Max(1, findQ.Length);
+                        if (hits.Count >= 5000) break;
+                    }
+                    if (hits.Count >= 5000) break;
+                }
+                if (keep && prev >= 0 && hits.Count > 0) findCur = Math.Min(prev, hits.Count - 1);
+            }
+            if (FindChanged != null) FindChanged(this, EventArgs.Empty);
+        }
+
+        int FirstHitFromView()
+        {
+            int top = (int)((TargetY - topPad) / lineH);
+            for (int i = 0; i < hits.Count; i++)
+            {
+                int v;
+                if (visualOf.TryGetValue(hits[i].L, out v) && v >= top) return i;
+            }
+            return 0;
+        }
+
+        public void FindNext(int dir)
+        {
+            if (hits.Count == 0) return;
+            int i = findCur < 0 ? FirstHitFromView() : (findCur + dir + hits.Count) % hits.Count;
+            GoToHit(i);
+        }
+
+        void GoToHit(int i)
+        {
+            findCur = i;
+            var h = hits[i];
+            int v;
+            if (visualOf.TryGetValue(h.L, out v))
+            {
+                // com quebra de linha, desce até o pedaço que contém a ocorrência
+                if (wrap && h.L.Wrap != null) for (int p = h.L.Wrap.Length - 1; p > 0; p--) if (h.S >= h.L.Wrap[p]) { v += p; break; }
+                float y = topPad + v * lineH;
+                if (y < TargetY + lineH || y > TargetY + ClientSize.Height - 2 * lineH) CenterVisual(v);
+                if (!wrap)
+                {
+                    float x = h.S * charW, vw = ViewW;
+                    if (x < offX || x + findQ.Length * charW > offX + vw) ScrollBy(0, Math.Max(0, x - vw / 3f) - offX);
+                }
+            }
+            Invalidate();
+            if (FindChanged != null) FindChanged(this, EventArgs.Empty);
+        }
+
         // ---------------------------------------------------------- trechos clicáveis
 
         DiffLine LineAt(int y)
@@ -243,6 +540,12 @@ namespace GitPainel
             if (!layoutSide) return data.Lines[vSrc[i]];
             var r = side[vSrc[i]];
             return r.Hunk ?? r.L ?? r.R;
+        }
+
+        DiffLine GapAt(Point p)
+        {
+            foreach (var kv in gapRects) if (kv.Key.Contains(p)) return kv.Value;
+            return null;
         }
 
         // ---------------------------------------------------------- seleção de texto
@@ -373,24 +676,36 @@ namespace GitPainel
                 Invalidate();
                 return;
             }
+            var gap = GapAt(e.Location);
+            bool more = moreRect.Contains(e.Location);
             int h = -1;
             var l = LineAt(e.Y);
-            if (hunksOn && l != null && l.K == DiffLine.Hunk) h = l.HunkIdx;
-            if (h != hoverHunk) { hoverHunk = h; Invalidate(); }
+            if (hunksOn && l != null && l.K == DiffLine.Hunk && gap == null) h = l.HunkIdx;
+            if (h != hoverHunk || gap != hoverGap || more != hoverMore) { hoverHunk = h; hoverGap = gap; hoverMore = more; Invalidate(); }
             bool text = data.Title == null && l != null && l.K != DiffLine.Hunk && e.X >= TextX(SideAt(e.X));
-            Cursor = h >= 0 ? Cursors.Hand : text ? Cursors.IBeam : Cursors.Default;
+            Cursor = h >= 0 || gap != null || more ? Cursors.Hand : text ? Cursors.IBeam : Cursors.Default;
         }
 
         protected override void OnContentMouseLeave()
         {
-            if (hoverHunk != -1) { hoverHunk = -1; Invalidate(); }
+            if (hoverHunk != -1 || hoverGap != null || hoverMore) { hoverHunk = -1; hoverGap = null; hoverMore = false; Invalidate(); }
         }
 
         protected override void OnContentMouseDown(MouseEventArgs e)
         {
             if (data.Title != null) return;
+            if (e.Button == MouseButtons.Left && GapAt(e.Location) != null)
+            {
+                if (e.Clicks == 1 && ExpandRequested != null) ExpandRequested(this, EventArgs.Empty);
+                return;
+            }
+            if (e.Button == MouseButtons.Left && moreRect.Contains(e.Location))
+            {
+                if (e.Clicks == 1 && ShowAllRequested != null) ShowAllRequested(this, EventArgs.Empty);
+                return;
+            }
             var l = LineAt(e.Y);
-            if (hunksOn && l != null && l.K == DiffLine.Hunk) { if (HunkToggled != null) HunkToggled(l.HunkIdx); return; }
+            if (hunksOn && l != null && l.K == DiffLine.Hunk) { if (e.Clicks == 1 && HunkToggled != null) HunkToggled(l.HunkIdx); return; }
             int sd = SideAt(e.X), s, c;
             PosAt(e.X, e.Y, sd, out s, out c);
             if ((ModifierKeys & Keys.Shift) != 0 && selSide == sd) { bSrc = s; bCh = c; }
@@ -423,21 +738,30 @@ namespace GitPainel
             if (dragScroll != null) dragScroll.Stop();
         }
 
+        public event EventHandler FindRequested;
+
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Right || data.Title != null) return;
             OpenMenu.ShowItems(this, e.Location,
                 OpenMenu.Item(G.Copy, "Copiar   (Ctrl+C)", HasSel, Copy),
-                OpenMenu.Item(G.Check, "Selecionar tudo   (Ctrl+A)", true, SelectAll));
+                OpenMenu.Item(G.Check, "Selecionar tudo   (Ctrl+A)", true, SelectAll),
+                OpenMenu.Separator(),
+                OpenMenu.Item(G.Search, "Buscar no diff   (Ctrl+F)", true, () => { if (FindRequested != null) FindRequested(this, EventArgs.Empty); }),
+                OpenMenu.Item(G.ArrowDown, "Próxima alteração   (F7)", blocks.Count > 0, () => NextChange(1)),
+                OpenMenu.Item(G.ArrowUp, "Alteração anterior   (Shift+F7)", blocks.Count > 0, () => NextChange(-1)));
         }
+
         // ---------------------------------------------------------- pintura
 
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
             g.Clear(T.Bg);
-            if (data.Title != null) { PaintEmpty(g); return; }
+            gapRects.Clear();
+            moreRect = Rectangle.Empty;
+            if (data.Title != null) { PaintEmpty(g); PaintLoading(g); return; }
 
             int first = Math.Max(0, (int)((offY - topPad) / lineH));
             int oy = (int)Math.Round(offY);
@@ -450,7 +774,57 @@ namespace GitPainel
             }
             if (layoutSide)
                 T.Fill(g, T.Border, new Rectangle(Half, 0, 1, ClientSize.Height));
+            if (data.Truncated > 0) PaintMore(g, topPad + vSrc.Count * lineH - oy);
+            PaintRuler(g);
             PaintBars(g);
+            PaintLoading(g);
+        }
+
+        // aviso no fim de um diff gigante, com o link para carregar o resto
+        void PaintMore(Graphics g, int y)
+        {
+            if (y > ClientSize.Height) return;
+            var r = new Rectangle(T.Px(16), y + lineH / 2, ClientSize.Width - T.Px(32), lineH * 2);
+            T.FillRound(g, T.Mix(T.Bg, T.Panel, 0.8f), r, T.Px(8));
+            string msg = "Mostrando " + keptLines.ToString("N0") + " de " + data.Truncated.ToString("N0") + " linhas do diff.";
+            string link = "Mostrar tudo";
+            int mw = T.Measure(g, msg, T.Small) + 1, lw = T.Measure(g, link, T.SmallBold) + T.Px(20);
+            int x = r.X + (r.Width - mw - lw - T.Px(12)) / 2;
+            T.Text(g, msg, T.Small, T.Comment, new Rectangle(x, r.Y, mw, r.Height), 0);
+            moreRect = new Rectangle(x + mw + T.Px(12), r.Y + (r.Height - T.Px(24)) / 2, lw, T.Px(24));
+            T.FillRound(g, hoverMore ? T.Line : T.Mix(T.Bg, T.Line, 0.6f), moreRect, T.Px(6));
+            T.Text(g, link, T.SmallBold, T.Purple, moreRect, TextFormatFlags.HorizontalCenter);
+        }
+
+        // régua na faixa da barra de rolagem: onde estão as alterações e as ocorrências da busca
+        void PaintRuler(Graphics g)
+        {
+            if (!HasV || contentH <= 0) return;
+            int h = ClientSize.Height, x = ClientSize.Width - T.Px(10), w = T.Px(7);
+            float scale = (float)h / contentH;
+            T.Fill(g, T.Mix(T.Bg, T.Border, 0.5f), new Rectangle(x - T.Px(2), 0, w + T.Px(4), h));
+            foreach (var b in blocks)
+            {
+                float y0 = (topPad + b[0] * lineH) * scale, y1 = (topPad + b[1] * lineH) * scale;
+                Color c = b[2] == 1 ? T.Green : b[2] == 2 ? T.Red : T.Orange;
+                T.Fill(g, T.A(c, 170), new Rectangle(x, (int)y0, w, Math.Max(T.Px(2), (int)(y1 - y0))));
+            }
+            for (int i = 0; i < hits.Count; i++)
+            {
+                int v;
+                if (!visualOf.TryGetValue(hits[i].L, out v)) continue;
+                int y = (int)((topPad + v * lineH) * scale);
+                T.Fill(g, i == findCur ? T.Orange : T.Yellow, new Rectangle(x - T.Px(2), y, w + T.Px(4), Math.Max(T.Px(2), 1)));
+            }
+        }
+
+        void PaintLoading(Graphics g)
+        {
+            if (!loading || !loadShown) return;
+            T.Fill(g, T.A(T.Bg, 150), ClientRectangle);
+            float s = T.Px(22);
+            var r = new RectangleF((ClientSize.Width - s) / 2f, T.Px(60), s, s);
+            T.Spinner(g, r, T.Purple, T.Px(2.4f));
         }
 
         void PaintEmpty(Graphics g)
@@ -510,7 +884,26 @@ namespace GitPainel
         {
             bool hot = hunksOn && l.HunkIdx == hoverHunk;
             T.Fill(g, T.Mix(T.Bg, T.Purple, hot ? 0.16f : 0.08f), new Rectangle(0, y, ClientSize.Width, lineH));
-            int right = ClientSize.Width - T.Px(16);
+            int right = ClientSize.Width - T.Px(16) - (HasV ? T.Px(10) : 0);
+
+            // linhas ocultas antes deste trecho: pílula que mostra mais contexto
+            int hidden;
+            if (hiddenBefore.TryGetValue(l, out hidden))
+            {
+                string gt = hidden == 1 ? "1 linha oculta" : hidden.ToString("N0") + " linhas ocultas";
+                int gw = T.Measure(g, gt, T.Small) + T.Px(34);
+                var gr = new Rectangle(right - gw, y + T.Px(2), gw, lineH - T.Px(4));
+                if (gr.X > textX + T.Px(120))
+                {
+                    bool gh = hoverGap == l;
+                    T.FillRound(g, gh ? T.Mix(T.Bg, T.Purple, 0.32f) : T.Mix(T.Bg, T.Purple, 0.15f), gr, gr.Height / 2f);
+                    T.Text(g, G.Expand, T.IconSmall, gh ? T.Fg : T.Purple, new Rectangle(gr.X + T.Px(9), gr.Y, T.Px(14), gr.Height), TextFormatFlags.HorizontalCenter);
+                    T.Text(g, gt, T.Small, gh ? T.Fg : T.Mix(T.Purple, T.Fg, 0.3f), new Rectangle(gr.X + T.Px(26), gr.Y, gw - T.Px(30), gr.Height), 0);
+                    gapRects.Add(new KeyValuePair<Rectangle, DiffLine>(gr, l));
+                    right = gr.X - T.Px(12);
+                }
+            }
+
             if (hunksOn)
             {
                 int st = hunkStates != null && l.HunkIdx < hunkStates.Length ? hunkStates[l.HunkIdx] : 0;
@@ -583,17 +976,32 @@ namespace GitPainel
                 ox = x + T.Px(2) - (int)Math.Round(offX - ps * charW);
             }
 
-            var clip = g.Clip;
+            // recorte simples por retângulo (ler g.Clip criava uma Region a cada linha)
             g.SetClip(new Rectangle(x, y, w, lineH));
 
             // realce do que mudou dentro da linha
-            if (l.ChgS >= 0 && !dim)
+            if (l.Chg != null && !dim)
             {
-                int a = Math.Max(ps, l.ChgS), b = Math.Min(pe, l.ChgE);
-                if (b > a)
+                Color hc = l.K == DiffLine.Add ? T.Mix(T.Bg, T.Green, 0.30f) : T.Mix(T.Bg, T.Red, 0.32f);
+                for (int k = 0; k + 1 < l.Chg.Length; k += 2)
                 {
-                    Color hc = l.K == DiffLine.Add ? T.Mix(T.Bg, T.Green, 0.30f) : T.Mix(T.Bg, T.Red, 0.32f);
-                    T.FillRound(g, hc, new RectangleF(ox + (a - ps) * charW, y + T.Px(2), (b - a) * charW, lineH - T.Px(4)), T.Px(3));
+                    int a = Math.Max(ps, l.Chg[k]), b = Math.Min(pe, l.Chg[k + 1]);
+                    if (b > a) T.FillRound(g, hc, new RectangleF(ox + (a - ps) * charW, y + T.Px(2), (b - a) * charW, lineH - T.Px(4)), T.Px(3));
+                }
+            }
+
+            // ocorrências da busca
+            List<int> found;
+            if (hitMap.TryGetValue(l, out found))
+            {
+                var cur = findCur >= 0 && findCur < hits.Count ? hits[findCur] : null;
+                foreach (int st in found)
+                {
+                    int a = Math.Max(ps, st), b = Math.Min(pe, st + findQ.Length);
+                    if (b <= a) continue;
+                    bool isCur = cur != null && cur.L == l && cur.S == st;
+                    T.FillRound(g, isCur ? T.A(T.Orange, 150) : T.A(T.Yellow, 70),
+                        new RectangleF(ox + (a - ps) * charW, y + T.Px(1), (b - a) * charW, lineH - T.Px(2)), T.Px(3));
                 }
             }
 
@@ -610,6 +1018,7 @@ namespace GitPainel
             Color baseC = l.K == DiffLine.Meta ? T.Comment : l.K == DiffLine.Ctx ? T.Mix(T.Fg, T.Bg, 0.12f) : T.Fg;
             var tok = l.Tok;
             int pos = ps, ti = 0, ty = y + (lineH - T.Mono.Height) / 2;
+            const TextFormatFlags flags = TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.PreserveGraphicsClipping;
             while (pos < pe)
             {
                 while (ti < tok.Count && tok[ti] + tok[ti + 1] <= pos) ti += 3;
@@ -619,11 +1028,10 @@ namespace GitPainel
                 else { end = ti < tok.Count ? Math.Min(pe, tok[ti]) : pe; c = baseC; }
                 if (end <= pos) end = pos + 1;
                 if (dim) c = T.Mix(c, T.Bg, 0.55f);
-                TextRenderer.DrawText(g, s.Substring(pos, end - pos), T.Mono, new Point(ox + (pos - ps) * charW, ty), c,
-                    TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.PreserveGraphicsClipping);
+                TextRenderer.DrawText(g, s.Substring(pos, end - pos), T.Mono, new Point(ox + (pos - ps) * charW, ty), c, flags);
                 pos = end;
             }
-            g.Clip = clip;
+            g.ResetClip();
         }
     }
 }

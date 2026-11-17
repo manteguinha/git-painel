@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -21,10 +21,10 @@ namespace GitPainel
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             Width = T.Px(380);
-            Padding = new Padding(0, T.Px(58), 1, 0);
+            Padding = new Padding(0, T.Px(62), 1, 0);
             list.Dock = DockStyle.Fill;
             Controls.Add(list);
-            close = new FlatButton(null, "Fechar") { Back = T.Panel, Width = T.Px(76), Height = T.Px(30) };
+            close = new FlatButton(null, "Fechar") { Back = T.Panel, Width = T.Px(76), Height = T.Px(32) };
             close.Click += delegate { if (Closed != null) Closed(this, EventArgs.Empty); };
             Controls.Add(close);
             list.FileSelected += f => { if (FileSelected != null) FileSelected(f); };
@@ -83,7 +83,7 @@ namespace GitPainel
         protected override void OnLayout(LayoutEventArgs e)
         {
             base.OnLayout(e);
-            if (close != null) close.Location = new Point(Width - close.Width - T.Px(14), (T.Px(58) - close.Height) / 2);
+            if (close != null) close.Location = new Point(Width - close.Width - T.Px(14), (T.Px(62) - close.Height) / 2);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -91,14 +91,14 @@ namespace GitPainel
             var g = e.Graphics;
             g.Clear(T.Panel);
             T.Fill(g, T.Border, new Rectangle(Width - 1, 0, 1, Height));
-            T.Fill(g, T.Border, new Rectangle(0, T.Px(58) - 1, Width, 1));
+            T.Fill(g, T.Border, new Rectangle(0, T.Px(62) - 1, Width, 1));
             if (repo == null) return;
             int x = T.Px(16), right = close.Left - T.Px(10);
-            T.Text(g, G.History, T.Icon, T.Purple, new Rectangle(x, T.Px(8), T.Px(18), T.Px(22)), TextFormatFlags.HorizontalCenter);
+            T.Text(g, G.History, T.Icon, T.Purple, new Rectangle(x, T.Px(10), T.Px(18), T.Px(22)), TextFormatFlags.HorizontalCenter);
             x += T.Px(26);
-            T.Text(g, "Histórico", T.UiBold, T.Fg, new Rectangle(x, T.Px(8), right - x, T.Px(22)), 0);
+            T.Text(g, "Histórico", T.UiBold, T.Fg, new Rectangle(x, T.Px(10), right - x, T.Px(22)), 0);
             string sub = repo.Name + (path.Length > 0 ? "  ›  " + path : "") + (repo.Branch.Length > 0 ? "   ·   " + repo.Branch : "");
-            T.Text(g, sub, T.Small, T.Comment, new Rectangle(T.Px(16), T.Px(30), right - T.Px(16), T.Px(20)), 0);
+            T.Text(g, sub, T.Small, T.Comment, new Rectangle(T.Px(16), T.Px(33), right - T.Px(16), T.Px(20)), 0);
         }
     }
 
@@ -124,6 +124,36 @@ namespace GitPainel
         public event EventHandler UndoRequested;
 
         public HistoryList() { BackColor = T.Panel; }
+
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+        // ↑/↓ percorrem os arquivos dos commits abertos no histórico
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Up || e.KeyCode == Keys.Down)
+            {
+                var files = rows.Where(r => r.K == Kind.File).ToList();
+                if (files.Count > 0)
+                {
+                    int idx = files.FindIndex(r => r.F == selected);
+                    int next = idx < 0 ? 0 : Math.Max(0, Math.Min(files.Count - 1, idx + (e.KeyCode == Keys.Down ? 1 : -1)));
+                    var row = files[next];
+                    if (row.F != selected)
+                    {
+                        selected = row.F;
+                        int pad = T.Px(8);
+                        if (row.Y - pad < TargetY) ScrollToY(row.Y - pad);
+                        else if (row.Y + row.H + pad > TargetY + ClientSize.Height) ScrollToY(row.Y + row.H + pad - ClientSize.Height);
+                        Invalidate();
+                        if (FileSelected != null) FileSelected(row.F);
+                    }
+                }
+                e.Handled = true;
+                return;
+            }
+            base.OnKeyDown(e);
+        }
 
         public int CommitCount { get { return commits.Count; } }
         public bool Loading { set { loading = value; Build(); } }
@@ -259,15 +289,14 @@ namespace GitPainel
         void PaintFile(Graphics g, FileChange f, Rectangle rect, bool hot)
         {
             bool sel = f == selected;
-            if (sel)
-            {
-                T.FillRound(g, T.Line, rect, T.Px(6));
-                T.FillRound(g, T.Purple, new RectangleF(rect.X, rect.Y + T.Px(6), T.Px(3), rect.Height - T.Px(12)), T.Px(1.5f));
-            }
-            else if (hot) T.FillRound(g, T.Mix(T.Panel, T.Line, 0.45f), rect, T.Px(6));
+            T.RowBackground(g, rect, hot ? 1 : 0, sel, Focused);
             var sr = new Rectangle(rect.Right - T.Px(26), rect.Y, T.Px(18), rect.Height);
             T.Text(g, f.Kind.ToString(), T.SmallBold, T.StatusColor(f.Kind), sr, TextFormatFlags.HorizontalCenter);
             int x = rect.X + T.Px(30), right = sr.X - T.Px(4);
+            string fg; Color fc;
+            T.FileIcon(f.Rel, out fg, out fc);
+            T.Text(g, fg, T.IconSmall, f.Kind == 'D' ? T.Mix(fc, T.Panel, 0.5f) : fc, new Rectangle(x, rect.Y, T.Px(14), rect.Height), TextFormatFlags.HorizontalCenter);
+            x += T.Px(20);
             Font nf = f.Kind == 'D' ? T.UiStrike : T.Ui;
             int nw = Math.Min(T.Measure(g, f.Name, nf) + 1, right - x);
             T.Text(g, f.Name, nf, f.Kind == 'D' ? T.Comment : T.Fg, new Rectangle(x, rect.Y, nw, rect.Height), 0);

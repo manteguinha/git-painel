@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Linq;
 using System;
 using System.Drawing;
@@ -54,7 +54,11 @@ namespace GitPainel
             tgtY = offY = Cl(y, 0, MaxY);
             tgtX = offX = Cl(x, 0, MaxX);
             Invalidate();
+            OnScrolled();
         }
+
+        // a rolagem parou numa posição nova (ex.: o cabeçalho do diff atualiza "alteração 2 de 5")
+        protected virtual void OnScrolled() { }
 
         protected void Reclamp()
         {
@@ -69,8 +73,8 @@ namespace GitPainel
             offX += dx * 0.26f;
             if (Math.Abs(dy) < 0.6f) offY = tgtY;
             if (Math.Abs(dx) < 0.6f) offX = tgtX;
-            if (offY == tgtY && offX == tgtX) anim.Stop();
             Invalidate();
+            if (offY == tgtY && offX == tgtX) { anim.Stop(); OnScrolled(); }
         }
 
         protected override void OnResize(EventArgs e) { base.OnResize(e); Reclamp(); Invalidate(); }
@@ -354,6 +358,7 @@ namespace GitPainel
             // pressionado: encolhe 1px, como um botão físico
             var r = down ? new RectangleF(1, 1, Width - 3, Height - 3) : new RectangleF(0, 0, Width - 1, Height - 1);
             T.FillRound(g, bg, r, T.Px(7));
+            if (Focused && ShowFocusCues) T.StrokeRound(g, T.Purple, new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1, r.Height - 1), T.Px(7), T.Px(1.5f));
             var tr = Rectangle.Round(r);
             if (glyph == null) { T.Text(g, Text, T.Ui, T.Fg, tr, TextFormatFlags.HorizontalCenter); return; }
             T.Text(g, glyph, T.Icon, T.Purple, new Rectangle(tr.X + T.Px(12), tr.Y, T.Px(18), tr.Height), TextFormatFlags.HorizontalCenter);
@@ -370,6 +375,13 @@ namespace GitPainel
             Invalidate();
             base.OnMouseUp(e);
             if (fire && T.Debounce(ref lastClick, 400)) OnClick(EventArgs.Empty);
+        }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Space && T.Debounce(ref lastClick, 400)) { OnClick(EventArgs.Empty); e.Handled = true; }
+            base.OnKeyDown(e);
         }
     }
 
@@ -417,6 +429,7 @@ namespace GitPainel
             if (down && Active && !busy) bg = T.Mix(bg, T.Bg, 0.18f);
             var r = down && Active && !busy ? new RectangleF(1, 1, Width - 3, Height - 3) : new RectangleF(0, 0, Width - 1, Height - 1);
             T.FillRound(g, bg, r, T.Px(8));
+            if (Focused && ShowFocusCues) T.StrokeRound(g, T.Fg, new RectangleF(r.X + 1.5f, r.Y + 1.5f, r.Width - 3, r.Height - 3), T.Px(7), T.Px(1.5f));
             Color fg = Active || busy ? T.Bg : T.Comment;
             if (!busy) { T.Text(g, Text, T.UiBold, fg, Rectangle.Round(r), TextFormatFlags.HorizontalCenter); return; }
 
@@ -438,6 +451,13 @@ namespace GitPainel
             Invalidate();
             base.OnMouseUp(e);
             if (fire && T.Debounce(ref lastClick, 500)) OnClick(EventArgs.Empty);
+        }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Space && Active && !busy && T.Debounce(ref lastClick, 500)) { OnClick(EventArgs.Empty); e.Handled = true; }
+            base.OnKeyDown(e);
         }
     }
     class DarkTextBox : TextBox
@@ -600,15 +620,227 @@ namespace GitPainel
             OwnerDraw = true;
             UseAnimation = true;
             UseFading = true;
+            // o tamanho vem da fonte da dica (sem isso o Windows mede com a fonte do sistema e o texto corta)
+            Popup += (s, e) =>
+            {
+                string t = GetToolTip(e.AssociatedControl);
+                if (string.IsNullOrEmpty(t)) t = lastText;
+                if (string.IsNullOrEmpty(t)) return;
+                var sz = TextRenderer.MeasureText(t, T.Small, new Size(T.Px(420), int.MaxValue), TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
+                e.ToolTipSize = new Size(sz.Width + T.Px(20), sz.Height + T.Px(12));
+            };
             Draw += (s, e) =>
             {
-                T.Fill(e.Graphics, T.Line, e.Bounds);
-                using (var p = new Pen(T.Border)) e.Graphics.DrawRectangle(p, 0, 0, e.Bounds.Width - 1, e.Bounds.Height - 1);
-                TextRenderer.DrawText(e.Graphics, e.ToolTipText, T.Small, e.Bounds, T.Fg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                T.Fill(e.Graphics, T.Mix(T.Line, T.Panel, 0.15f), e.Bounds);
+                e.Graphics.DrawRectangle(T.PenOf(T.Border, 1), 0, 0, e.Bounds.Width - 1, e.Bounds.Height - 1);
+                var r = new Rectangle(e.Bounds.X + T.Px(10), e.Bounds.Y + T.Px(6), e.Bounds.Width - T.Px(20), e.Bounds.Height - T.Px(12));
+                TextRenderer.DrawText(e.Graphics, e.ToolTipText, T.Small, r, T.Fg, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
             };
         }
 
-        public void ShowAt(string text, IWin32Window owner, int x, int y) { Show(text, owner, x, y, 4000); }
+        string lastText;
+        public void ShowAt(string text, IWin32Window owner, int x, int y) { lastText = text; Show(text, owner, x, y, 5000); }
+    }
+
+    // dica que aparece depois de um instante parado sobre um elemento desenhado (ícone, texto cortado…)
+    class HoverTip
+    {
+        readonly Control owner;
+        readonly DarkTip tip = new DarkTip();
+        readonly Timer wait = new Timer { Interval = 450 };
+        string pending;
+        bool shown;
+        Rectangle area;
+
+        public HoverTip(Control c)
+        {
+            owner = c;
+            wait.Tick += delegate
+            {
+                wait.Stop();
+                if (pending == null || !owner.IsHandleCreated || !owner.Visible) return;
+                int x = Math.Max(0, Math.Min(area.X, owner.ClientSize.Width - T.Px(200)));
+                tip.ShowAt(pending, owner, x, area.Bottom + T.Px(4));
+                shown = true;
+            };
+        }
+
+        // text null = nada sob o mouse; chamar a cada movimento
+        public void Set(string text, Rectangle r)
+        {
+            if (text == pending) { area = r; return; }
+            pending = text;
+            area = r;
+            wait.Stop();
+            if (shown) { tip.Hide(owner); shown = false; }
+            if (text != null) wait.Start();
+        }
+
+        public void Clear() { Set(null, Rectangle.Empty); }
+    }
+
+    // botão de ícone (barra do diff): hover suave, pode ser liga/desliga, dica com atalho
+    class IconButton : Control
+    {
+        public string Glyph, Tip;
+        public bool Toggleable;
+        bool on, over, down;
+        float h;
+        DateTime lastClick;
+        readonly Timer anim = new Timer { Interval = 15 };
+        readonly HoverTip tip;
+        public Color Back = T.Bg;
+
+        public IconButton(string glyph, string tipText)
+        {
+            Glyph = glyph;
+            Tip = tipText;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            SetStyle(ControlStyles.StandardClick | ControlStyles.StandardDoubleClick, false);
+            Size = new Size(T.Px(32), T.Px(32));
+            Cursor = Cursors.Hand;
+            tip = new HoverTip(this);
+            anim.Tick += delegate
+            {
+                float t = over ? 1 : 0;
+                h += (t - h) * 0.3f;
+                if (Math.Abs(t - h) < 0.02f) { h = t; anim.Stop(); }
+                Invalidate();
+            };
+        }
+
+        public bool On
+        {
+            get { return on; }
+            set { if (on == value) return; on = value; Invalidate(); }
+        }
+
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Cursor = Enabled ? Cursors.Hand : Cursors.Default; Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Back);
+            var r = down ? new RectangleF(1, 1, Width - 3, Height - 3) : new RectangleF(0, 0, Width - 1, Height - 1);
+            Color bg = on ? T.Mix(Back, T.Purple, 0.20f + 0.08f * h) : T.Mix(Back, T.Line, 0.85f * h);
+            if (on || h > 0.01f) T.FillRound(g, bg, r, T.Px(7));
+            Color fg = !Enabled ? T.Mix(T.Comment, Back, 0.45f) : on ? T.Purple : T.Mix(T.Mix(T.Comment, T.Fg, 0.35f), T.Fg, h);
+            T.Text(g, Glyph, T.Icon, fg, Rectangle.Round(r), TextFormatFlags.HorizontalCenter);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { over = true; anim.Start(); base.OnMouseEnter(e); }
+        protected override void OnMouseMove(MouseEventArgs e) { tip.Set(Tip, new Rectangle(0, 0, Width, Height)); base.OnMouseMove(e); }
+        protected override void OnMouseLeave(EventArgs e) { over = false; down = false; tip.Clear(); anim.Start(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left && Enabled) { down = true; tip.Clear(); Invalidate(); } base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            bool fire = down && e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location) && Enabled;
+            down = false;
+            Invalidate();
+            base.OnMouseUp(e);
+            if (!fire || !T.Debounce(ref lastClick, 150)) return;
+            if (Toggleable) on = !on;
+            OnClick(EventArgs.Empty);
+        }
+    }
+
+    // busca dentro do diff (Ctrl+F com o diff em foco): flutua no canto do diff, como nos editores
+    class DiffFindBar : Control
+    {
+        public readonly DarkTextBox Box;
+        public event EventHandler QueryChanged, Closed;
+        public event Action<int> Next;
+        string count = "";
+        bool none;
+        string hot;
+        readonly HoverTip tip;
+
+        public DiffFindBar()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            Size = new Size(T.Px(380), T.Px(44));
+            Box = new DarkTextBox(false) { Placeholder = "Buscar no diff…" };
+            Controls.Add(Box);
+            tip = new HoverTip(this);
+            Box.TextChanged += delegate { if (QueryChanged != null) QueryChanged(this, EventArgs.Empty); };
+            Box.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.F3) { if (Next != null) Next(e.Shift ? -1 : 1); e.SuppressKeyPress = e.Handled = true; }
+                else if (e.KeyCode == Keys.Escape) { if (Closed != null) Closed(this, EventArgs.Empty); e.SuppressKeyPress = e.Handled = true; }
+            };
+            Box.GotFocus += delegate { Invalidate(); };
+            Box.LostFocus += delegate { Invalidate(); };
+        }
+
+        public void SetCount(int index, int total, bool hasQuery)
+        {
+            none = hasQuery && total == 0;
+            count = !hasQuery ? "" : total == 0 ? "nenhum resultado" : (index >= 0 ? (index + 1).ToString() : "–") + " de " + total + (total >= 5000 ? "+" : "");
+            Invalidate();
+        }
+
+        Rectangle Frame { get { return new Rectangle(T.Px(6), T.Px(6), Width - T.Px(12), Height - T.Px(12)); } }
+        Rectangle Btn(int i) { var f = Frame; int s = T.Px(26); return new Rectangle(f.Right - T.Px(4) - (3 - i) * s, f.Y + (f.Height - s) / 2, s, s); }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            if (Box == null) return;
+            var f = Frame;
+            int ih = T.Ui.Height;
+            Box.SetBounds(f.X + T.Px(30), f.Y + (f.Height - ih) / 2, Btn(0).X - T.Px(96) - f.X - T.Px(30), ih);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(T.Bg);
+            var f = Frame;
+            // sombra discreta + caixa
+            T.FillRound(g, T.A(T.Border, 160), new RectangleF(f.X - T.Px(3), f.Y - T.Px(1), f.Width + T.Px(6), f.Height + T.Px(6)), T.Px(9));
+            T.FillRound(g, T.Field, f, T.Px(8));
+            T.StrokeRound(g, Box.Focused ? T.Purple : T.Line, new RectangleF(f.X + 0.5f, f.Y + 0.5f, f.Width - 1, f.Height - 1), T.Px(8), T.Px(1));
+            T.Text(g, G.Search, T.IconSmall, Box.Focused ? T.Purple : T.Comment, new Rectangle(f.X + T.Px(10), f.Y, T.Px(14), f.Height), TextFormatFlags.HorizontalCenter);
+            int cw = T.Px(88);
+            T.Text(g, count, T.Small, none ? T.Red : T.Comment, new Rectangle(Btn(0).X - cw - T.Px(4), f.Y, cw, f.Height), TextFormatFlags.Right);
+            string[] glyphs = { G.ArrowUp, G.ArrowDown, G.Close };
+            string[] ids = { "prev", "next", "close" };
+            for (int i = 0; i < 3; i++)
+            {
+                var r = Btn(i);
+                if (hot == ids[i]) T.FillRound(g, T.Line, r, T.Px(6));
+                T.Text(g, glyphs[i], T.IconSmall, hot == ids[i] ? T.Fg : T.Mix(T.Comment, T.Fg, 0.4f), r, TextFormatFlags.HorizontalCenter);
+            }
+        }
+
+        string HitBtn(Point p)
+        {
+            string[] ids = { "prev", "next", "close" };
+            for (int i = 0; i < 3; i++) if (Btn(i).Contains(p)) return ids[i];
+            return null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            string h = HitBtn(e.Location);
+            if (h != hot) { hot = h; Invalidate(); }
+            tip.Set(h == "prev" ? "Anterior   (Shift+Enter)" : h == "next" ? "Próximo   (Enter)" : h == "close" ? "Fechar   (Esc)" : null,
+                h == null ? Rectangle.Empty : Btn(h == "prev" ? 0 : h == "next" ? 1 : 2));
+            Cursor = h != null ? Cursors.Hand : Cursors.IBeam;
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { hot = null; tip.Clear(); Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            string h = HitBtn(e.Location);
+            if (h == "prev" && Next != null) Next(-1);
+            else if (h == "next" && Next != null) Next(1);
+            else if (h == "close" && Closed != null) Closed(this, EventArgs.Empty);
+            if (h != "close") Box.Focus();
+            base.OnMouseDown(e);
+        }
     }
 
     // ------------------------------------------------------------------ barras
@@ -685,7 +917,7 @@ namespace GitPainel
             // versão, discreta
             string ver = "v" + Updater.CurrentText;
             int vw = T.Measure(g, ver, T.Small) + 1;
-            T.Text(g, ver, T.Small, T.Mix(T.Comment, T.Panel, 0.25f), new Rectangle(x, T.Px(2), vw, h), 0);
+            T.Text(g, ver, T.Small, T.Mix(T.Comment, T.Panel, 0.25f), new Rectangle(x, T.Px(1), vw, h), 0);
             x += vw + T.Px(14);
 
             // pasta atual: só o nome; clicar troca de pasta
@@ -833,9 +1065,13 @@ namespace GitPainel
     {
         public readonly Toggle Mode;
         public readonly ChipToggle Wrap;
+        // navegação, busca e opções de exibição do diff
+        public readonly IconButton Prev, NextBtn, Find, Space, Full, More;
+        public event Action<int> NavRequested;
+        public event EventHandler FindRequested, OptionsChanged;
         FileChange file;
         DiffData data;
-        string note;
+        string note, nav = "";
 
         public DiffHeader()
         {
@@ -843,22 +1079,71 @@ namespace GitPainel
             Height = T.Px(62);
             Mode = new Toggle(new[] { "Unificado", "Lado a lado" });
             Wrap = new ChipToggle("Quebrar linhas");
-            Controls.Add(Mode);
-            Controls.Add(Wrap);
+            Prev = new IconButton(G.ArrowUp, "Alteração anterior   (Shift+F7)");
+            NextBtn = new IconButton(G.ArrowDown, "Próxima alteração   (F7)");
+            Find = new IconButton(G.Search, "Buscar no diff   (Ctrl+F)");
+            Space = new IconButton(G.Whitespace, "Ignorar mudanças só de espaço em branco") { Toggleable = true };
+            Full = new IconButton(G.FullFile, "Mostrar o arquivo inteiro") { Toggleable = true };
+            More = new IconButton(G.More, "Mais opções");
+            foreach (Control c in new Control[] { Mode, Wrap, Prev, NextBtn, Find, Space, Full, More }) Controls.Add(c);
+            Prev.Click += delegate { if (NavRequested != null) NavRequested(-1); };
+            NextBtn.Click += delegate { if (NavRequested != null) NavRequested(1); };
+            Find.Click += delegate { if (FindRequested != null) FindRequested(this, EventArgs.Empty); };
+            Space.Click += delegate { if (OptionsChanged != null) OptionsChanged(this, EventArgs.Empty); };
+            Full.Click += delegate { if (OptionsChanged != null) OptionsChanged(this, EventArgs.Empty); };
+            More.Click += delegate { ShowMore(); };
         }
 
         public void Set(FileChange f, DiffData d) { file = f; data = d; Invalidate(); }
         public void SetNote(string n) { if (n != note) { note = n; Invalidate(); } }
 
+        // "2 de 5" ao lado das setas; sem alterações as setas ficam apagadas
+        public void SetNav(int current, int total)
+        {
+            string n = total == 0 ? "" : (current <= 0 ? "–" : current.ToString()) + " de " + total;
+            Prev.Enabled = NextBtn.Enabled = total > 0;
+            if (n != nav) { nav = n; Invalidate(); }
+        }
+
+        // menu ⋯: o que não coube na barra (modo e quebra de linha em janelas estreitas)
+        void ShowMore()
+        {
+            var items = new List<ToolStripItem>();
+            items.Add(OpenMenu.Option("Unificado", Mode.Selected == 0, () => Mode.Selected = 0));
+            items.Add(OpenMenu.Option("Lado a lado", Mode.Selected == 1, () => Mode.Selected = 1));
+            items.Add(OpenMenu.Separator());
+            items.Add(OpenMenu.Option("Quebrar linhas   (Alt+Z)", Wrap.On, () => Wrap.On = !Wrap.On));
+            OpenMenu.ShowItems(this, new Point(More.Left, More.Bottom + T.Px(4)), items.ToArray());
+        }
+
         protected override void OnLayout(LayoutEventArgs e)
         {
             base.OnLayout(e);
-            if (Mode == null || Wrap == null) return;
-            // em larguras pequenas (histórico aberto) os botões saem para o nome do arquivo caber
-            Mode.Visible = Width >= T.Px(560);
-            Wrap.Visible = Width >= T.Px(780);
-            Mode.Location = new Point(Width - Mode.Width - T.Px(16), (Height - 1 - Mode.Height) / 2);
-            Wrap.Location = new Point(Mode.Left - T.Px(8) - Wrap.Width, (Height - 1 - Wrap.Height) / 2);
+            if (More == null) return;
+            int cy = (Height - 1) / 2;
+            // o que não cabe vai para o menu ⋯ (nada some sem ter outro caminho)
+            // (bools locais: Control.Visible devolve false enquanto a janela ainda não apareceu)
+            bool showMode = Width >= T.Px(700), showWrap = Width >= T.Px(900), showMore = !showMode || !showWrap;
+            Mode.Visible = showMode;
+            Wrap.Visible = showWrap;
+            More.Visible = showMore;
+            int x = Width - T.Px(16);
+            if (showMode) { x -= Mode.Width; Mode.Location = new Point(x, cy - Mode.Height / 2); x -= T.Px(8); }
+            if (showWrap) { x -= Wrap.Width; Wrap.Location = new Point(x, cy - Wrap.Height / 2); x -= T.Px(8); }
+            if (showMore) { x -= More.Width; More.Location = new Point(x, cy - More.Height / 2); x -= T.Px(2); }
+            foreach (var b in new[] { Full, Space, Find })
+            {
+                x -= b.Width;
+                b.Location = new Point(x, cy - b.Height / 2);
+                x -= T.Px(2);
+            }
+            x -= T.Px(10);
+            foreach (var b in new[] { NextBtn, Prev })
+            {
+                x -= b.Width;
+                b.Location = new Point(x, cy - b.Height / 2);
+                x -= T.Px(2);
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -866,7 +1151,15 @@ namespace GitPainel
             var g = e.Graphics;
             g.Clear(T.Bg);
             T.Fill(g, T.Border, new Rectangle(0, Height - 1, Width, 1));
-            int right = (Wrap.Visible ? Wrap.Left : Mode.Visible ? Mode.Left : Width) - T.Px(16);
+            // separador fino entre a navegação e as opções
+            T.Fill(g, T.Line, new Rectangle(Find.Left - T.Px(7), (Height - T.Px(18)) / 2, 1, T.Px(18)));
+            int right = Prev.Left - T.Px(10);
+            if (nav.Length > 0)
+            {
+                int navW = T.Measure(g, nav, T.Small) + 1;
+                T.Text(g, nav, T.Small, T.Comment, new Rectangle(right - navW, 0, navW, Height - 1), 0);
+                right -= navW + T.Px(14);
+            }
             int x = T.Px(20);
             if (file == null)
             {
@@ -908,7 +1201,7 @@ namespace GitPainel
 
     class StatusBar : Control
     {
-        public string LeftText = "", RightText = "atualização automática     Espaço marca para commit     Ctrl+F buscar     Alt+Z quebrar linhas";
+        public string LeftText = "", RightText = "Espaço marca para commit     F7 próxima alteração     Ctrl+F buscar     F1 atalhos";
         public bool Busy;
         public string Working; // operação em andamento (push, pull…), mostrada no lugar do resumo
         string flash, flashLink;
@@ -955,8 +1248,12 @@ namespace GitPainel
                 T.Dot(g, T.Mix(T.Border, T.Purple, 0.45f + 0.55f * T.Pulse), x, (Height - d) / 2f, d);
                 x += T.Px(14);
             }
+            // as dicas da direita cedem espaço ao resumo em janelas estreitas (somem por inteiro, sem cortar)
+            string main = Working ?? flash ?? LeftText;
+            int need = T.Measure(g, main, T.Small) + T.Px(flash != null ? 140 : 40);
             int rw = T.Measure(g, RightText, T.Small) + 1;
-            T.Text(g, RightText, T.Small, T.Mix(T.Comment, T.Border, 0.3f), new Rectangle(Width - rw - T.Px(14), 0, rw, Height), 0);
+            if (Width - x - need < rw + T.Px(30)) rw = 0;
+            else T.Text(g, RightText, T.Small, T.Mix(T.Comment, T.Border, 0.3f), new Rectangle(Width - rw - T.Px(14), 0, rw, Height), 0);
             int avail = Width - rw - T.Px(40) - x;
             linkRect = Rectangle.Empty;
             if (Working != null)
@@ -1051,23 +1348,29 @@ namespace GitPainel
         public MessageDialog(string title, string message, string detail, string primary, Color accent) : this(title, message, detail, primary, accent, "Cancelar") { }
 
         // cancelText: texto do botão secundário (ex.: "Agora não" quando "Cancelar" seria ambíguo)
-        public MessageDialog(string title, string message, string detail, string primary, Color accent, string cancelText)
+        public MessageDialog(string title, string message, string detail, string primary, Color accent, string cancelText) : this(title, message, detail, primary, accent, cancelText, 220) { }
+
+        // detailMax: altura máxima (px lógicos) da caixa de detalhes antes de ganhar rolagem
+        public MessageDialog(string title, string message, string detail, string primary, Color accent, string cancelText, int detailMax)
         {
             Text = title;
             BackColor = T.Bg;
             ForeColor = T.Fg;
             Font = T.Ui;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
+            // sem moldura nativa: mesma linguagem visual da janela principal (cantos arredondados, sombra, faixa de destaque)
+            FormBorderStyle = FormBorderStyle.None;
             MaximizeBox = MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
             KeyPreview = true;
-            int w = T.Px(620), pad = T.Px(20);
+            DoubleBuffered = true;
+            this.accent = accent;
+            int w = T.Px(620), pad = T.Px(24);
 
-            var head = new Label
+            var head = new CaptionLabel
             {
                 Text = title, Font = T.UiBold, ForeColor = accent, BackColor = T.Bg, AutoSize = false,
-                Location = new Point(pad, T.Px(18)), Size = new Size(w - 2 * pad, T.Px(24))
+                Location = new Point(pad, T.Px(24)), Size = new Size(w - 2 * pad, T.Px(24))
             };
             Controls.Add(head);
             int y = head.Bottom + T.Px(8);
@@ -1091,8 +1394,8 @@ namespace GitPainel
                 int perLine = Math.Max(20, (w - 2 * pad - T.Px(40)) / Math.Max(1, TextRenderer.MeasureText("M", T.MonoSmall, Size.Empty, TextFormatFlags.NoPadding).Width));
                 int lines = text.Split('\n').Sum(l => Math.Max(1, (l.Length + perLine - 1) / perLine));
                 int want = lines * (T.MonoSmall.Height + 1) + T.Px(26);
-                bool scroll = want > T.Px(220);
-                var frame = new Panel { BackColor = T.Panel, Location = new Point(pad, y), Size = new Size(w - 2 * pad, Math.Min(want, T.Px(220))), Padding = new Padding(T.Px(12)) };
+                bool scroll = want > T.Px(detailMax);
+                var frame = new Panel { BackColor = T.Panel, Location = new Point(pad, y), Size = new Size(w - 2 * pad, Math.Min(want, T.Px(detailMax))), Padding = new Padding(T.Px(12)) };
                 var box = new TextBox
                 {
                     Multiline = true, ReadOnly = true, ScrollBars = scroll ? ScrollBars.Vertical : ScrollBars.None, BorderStyle = BorderStyle.None,
@@ -1110,9 +1413,10 @@ namespace GitPainel
             ok.Location = new Point(w - pad - ok.Width, y);
             ok.Click += delegate { DialogResult = primary == null ? DialogResult.Cancel : DialogResult.OK; Close(); };
             Controls.Add(ok);
+            FlatButton cancel = null;
             if (primary != null)
             {
-                var cancel = new FlatButton(null, cancelText) { Back = T.Bg, Height = T.Px(38), Width = T.Px(120) };
+                cancel = new FlatButton(null, cancelText) { Back = T.Bg, Height = T.Px(38), Width = T.Px(120) };
                 cancel.Location = new Point(ok.Left - T.Px(10) - cancel.Width, y);
                 cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
                 Controls.Add(cancel);
@@ -1122,14 +1426,58 @@ namespace GitPainel
             KeyDown += (s, e) =>
             {
                 if (e.KeyCode == Keys.Escape) { DialogResult = DialogResult.Cancel; Close(); }
-                else if (e.KeyCode == Keys.Enter) { DialogResult = primary == null ? DialogResult.Cancel : DialogResult.OK; Close(); }
+                else if (e.KeyCode == Keys.Enter)
+                {
+                    // Enter respeita o botão com foco (Tab até "Cancelar" + Enter cancela)
+                    bool onCancel = cancel != null && ActiveControl == cancel;
+                    DialogResult = primary == null || onCancel ? DialogResult.Cancel : DialogResult.OK;
+                    Close();
+                }
             };
+        }
+
+        readonly Color accent;
+
+        // título que deixa o clique passar para o diálogo (arrastar pelo título move a janela)
+        class CaptionLabel : Label
+        {
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == 0x0084) { m.Result = (IntPtr)(-1); return; } // HTTRANSPARENT
+                base.WndProc(ref m);
+            }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.ClassStyle |= 0x20000; return cp; } // CS_DROPSHADOW
         }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            Native.DarkTitle(Handle, T.Border, T.Fg);
+            Native.RoundCorners(Handle, false, T.Line);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            // faixa fina na cor do diálogo (vermelho = erro, roxo = informação…) e borda para o Windows 10
+            T.Fill(g, T.Mix(T.Bg, accent, 0.85f), new Rectangle(0, 0, ClientSize.Width, T.Px(3)));
+            g.DrawRectangle(T.PenOf(T.Line, 1), 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+        }
+
+        // arrastar pela parte de cima move o diálogo
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x0084 && m.Result == (IntPtr)1) // WM_NCHITTEST → HTCLIENT
+            {
+                long lp = m.LParam.ToInt64();
+                var pt = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
+                if (pt.Y < T.Px(56)) m.Result = (IntPtr)2; // HTCAPTION
+            }
         }
 
         public static bool Confirm(IWin32Window owner, string title, string message, string detail, string primary, Color accent)

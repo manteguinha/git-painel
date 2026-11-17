@@ -100,13 +100,38 @@ namespace GitPainel
         public static void ShowItems(Control owner, Point at, params ToolStripItem[] items)
         {
             var menu = new ContextMenuStrip { Renderer = new DarkRenderer(), Font = T.Ui, ShowImageMargin = true, ImageScalingSize = new Size(T.Px(16), T.Px(16)) };
+            menu.Padding = new Padding(T.Px(2), T.Px(4), T.Px(2), T.Px(4));
             menu.Items.AddRange(items);
-            menu.Closed += delegate { owner.BeginInvoke((Action)(() => menu.Dispose())); };
+            // Windows 11: cantos arredondados e borda na cor do tema
+            menu.Opened += delegate { Native.RoundCorners(menu.Handle, true, T.Line); };
+            menu.Closed += delegate
+            {
+                owner.BeginInvoke((Action)(() =>
+                {
+                    // os ícones são bitmaps criados para este menu: libera junto
+                    foreach (ToolStripItem it in items) if (it.Image != null) { var img = it.Image; it.Image = null; img.Dispose(); }
+                    menu.Dispose();
+                }));
+            };
             menu.Show(owner, at);
+        }
+
+        // opção marcável (ex.: "Lado a lado" no menu ⋯ do diff)
+        public static ToolStripMenuItem Option(string text, bool on, Action click)
+        {
+            var it = Item(null, text, true, click);
+            it.Checked = on;
+            return it;
         }
 
         public static ToolStripMenuItem Item(string glyph, string text, bool enabled, Action click)
         {
+            if (glyph == null)
+            {
+                var plain = new ToolStripMenuItem(text) { Enabled = enabled, Padding = new Padding(0, T.Px(3), 0, T.Px(3)) };
+                plain.Click += delegate { try { click(); } catch (Exception ex) { MessageDialog.Error(null, "Não foi possível abrir", ex.Message); } };
+                return plain;
+            }
             var it = new ToolStripMenuItem(text, Glyph(glyph, enabled ? T.Purple : T.Line)) { Enabled = enabled, Padding = new Padding(0, T.Px(3), 0, T.Px(3)) };
             it.Click += delegate
             {
@@ -156,6 +181,14 @@ namespace GitPainel
         class DarkRenderer : ToolStripProfessionalRenderer
         {
             public DarkRenderer() : base(new DarkColors()) { RoundedEdges = false; }
+
+            // item em destaque: pílula arredondada com margem, como nos menus do Windows 11
+            protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+            {
+                if (!e.Item.Selected || !e.Item.Enabled) return;
+                var r = new Rectangle(T.Px(4), 1, e.Item.Width - T.Px(8), e.Item.Height - 2);
+                T.FillRound(e.Graphics, T.Line, r, T.Px(5));
+            }
 
             protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
             {

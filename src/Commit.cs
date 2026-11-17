@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -166,7 +166,7 @@ namespace GitPainel
             int w = Width - 2 * pad;
             int ih = T.Ui.Height;
             int chipW;
-            using (var g = CreateGraphics()) chipW = T.Measure(g, ChipText, T.Small) + T.Px(28);
+            chipW = TextRenderer.MeasureText(ChipText, T.Small, Size.Empty, TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding).Width + T.Px(28);
             chipRect = new Rectangle(pad + T.Px(4), yField + T.Px(4), chipW, T.Px(26));
             int sx = chipRect.Right + T.Px(10);
             Summary.SetBounds(sx, yField + (T.Px(34) - ih) / 2, pad + w - T.Px(52) - sx, ih);
@@ -205,7 +205,7 @@ namespace GitPainel
             T.Text(g, ChipText, T.Small, type != null ? T.Purple : T.Mix(T.Comment, T.Fg, chipHot ? 0.6f : 0.2f),
                 new Rectangle(chipRect.X + T.Px(9), chipRect.Y, chipRect.Width - T.Px(24), chipRect.Height), 0);
             T.Text(g, G.Down, T.IconSmall, T.Comment, new Rectangle(chipRect.Right - T.Px(16), chipRect.Y, T.Px(10), chipRect.Height), TextFormatFlags.HorizontalCenter);
-            int len = Message.Split('\n')[0].Length;
+            int len = Prefix.Length + Summary.Text.Trim().Length; // 1ª linha do commit: prefixo + resumo
             T.Text(g, len + "/72", T.Small, len > 72 ? T.Orange : T.Comment, new Rectangle(fr.Right - T.Px(48), fr.Y, T.Px(40), fr.Height), TextFormatFlags.Right);
 
             if (showDesc) DarkTextBox.Frame(g, new Rectangle(pad, yDesc, w, T.Px(58)), Desc, T.Panel);

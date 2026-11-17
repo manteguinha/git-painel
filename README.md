@@ -4,18 +4,24 @@ Painel desktop para Windows que mostra, numa tela só, as alterações de **todo
 
 ![Git Painel](docs/screenshot.png)
 
-- **Leve e portátil:** um único `.exe` de ~160 KB, sem instalação e sem Node, Electron ou servidor.
+- **Leve e portátil:** um único `.exe` de ~240 KB, sem instalação e sem Node, Electron ou servidor.
 - **Tema Dracula:** interface escura desenhada à mão, com rolagem suave.
 
 ## Funcionalidades
 
 **Visualização**
 - Lista os repositórios encontrados na pasta escolhida, com branch e botões de sincronização (`↑ Enviar`, `↓ Atualizar`, `Publicar`).
+- **Visão geral:** sem arquivo aberto, um cartão por repositório mostra branch, alterações, commits a enviar/receber e o último commit.
 - Agrupa os arquivos por **módulo**: pastas com `package.json`, `serverless.yml`, `requirements.txt`, `pyproject.toml` e parecidos. Ex.: `apps/cadastro`.
+- Cada arquivo mostra o ícone do tipo e quantas linhas entraram e saíram (`+12 −4`).
 - **Meus módulos:** marque módulos com estrela e filtre só os seus.
 - **Diff:** unificado ou lado a lado, quebra de linha, cores de sintaxe (TS/JS, JSON, Python, SQL, C#, CSS, YAML) e realce das palavras que mudaram.
+  - Navegação entre alterações (F7 / Shift+F7) e régua lateral com a posição de cada mudança.
+  - Busca dentro do diff (Ctrl+F com o foco no diff).
+  - "N linhas ocultas" entre os trechos: clique para ver mais contexto, ou mostre o arquivo inteiro.
+  - Opção de ignorar mudanças só de espaço em branco.
 - Seleção e cópia de código no diff.
-- Busca de arquivos, expandir e recolher tudo.
+- Busca de arquivos, expandir e recolher tudo, navegação completa pelo teclado (F1 lista os atalhos).
 - Atualização automática quando arquivos mudam; respeita o `.gitignore`.
 
 **Commit e sincronização**
@@ -55,10 +61,14 @@ O app usa o .NET Framework 4.8, que já vem no Windows.
 
 | Atalho | Ação |
 |---|---|
+| F1 | Lista de atalhos |
 | F5 | Atualizar |
-| Ctrl+F | Buscar arquivo (↓ ou Enter vai para a lista) |
+| Ctrl+F | Buscar arquivo (na lista) ou buscar no diff (com o foco no diff) |
+| F7 / Shift+F7 | Próxima / anterior alteração no diff (também Alt+↓ / Alt+↑) |
+| ↑ ↓ ← → | Navegar pela lista: repositórios, módulos, commits e arquivos; ← → recolhem e expandem |
+| Enter | Abrir o arquivo no VS Code (na lista) |
 | Ctrl+O | Trocar de pasta |
-| Espaço | Marcar/desmarcar o arquivo selecionado para o commit |
+| Espaço | Marcar/desmarcar o arquivo (ou módulo) selecionado para o commit |
 | Ctrl+Enter | Fazer o commit |
 | Ctrl+↓ / Ctrl+↑ | Expandir / recolher tudo |
 | Alt+Z | Quebrar linhas no diff |
@@ -91,6 +101,7 @@ O `GitPainel.exe` é gerado na mesma pasta.
 | `src/Diff.cs` | Visualizador de diff |
 | `src/Sintaxe.cs` | Realce de sintaxe |
 | `src/Historico.cs` | Painel de histórico de commits |
+| `src/Resumo.cs` | Visão geral dos repositórios (quando nenhum arquivo está aberto) |
 | `src/Commit.cs` | Painel de commit |
 | `src/Controles.cs` | Botões, barras, diálogos e rolagem suave |
 | `src/Menu.cs` | Menus do botão direito |

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -23,6 +23,11 @@ namespace GitPainel
         readonly HistoryPane history = new HistoryPane();
         readonly DiffHeader header = new DiffHeader();
         readonly DiffView diff = new DiffView();
+        readonly DiffFindBar find = new DiffFindBar();
+        readonly OverviewPanel overview = new OverviewPanel();
+        // contexto extra pedido para o arquivo atual (faixa "N linhas ocultas") e diff gigante liberado
+        int extraContext;
+        string noLimitKey;
         readonly Dictionary<string, Git.RepoStyle> styles = new Dictionary<string, Git.RepoStyle>(StringComparer.OrdinalIgnoreCase);
         readonly Dictionary<string, string> ini = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly string iniPath;
@@ -57,9 +62,18 @@ namespace GitPainel
             // direita: histórico (opcional) + cabeçalho + diff
             var inner = new Panel { Dock = DockStyle.Fill, BackColor = T.Bg };
             diff.Dock = DockStyle.Fill;
+            overview.Dock = DockStyle.Fill;
             header.Dock = DockStyle.Top;
             inner.Controls.Add(diff);
+            inner.Controls.Add(overview);
             inner.Controls.Add(header);
+            // busca no diff: flutua no canto superior direito do diff
+            find.Visible = false;
+            inner.Controls.Add(find);
+            find.BringToFront();
+            Action placeFind = () => find.Location = new Point(Math.Max(0, inner.ClientSize.Width - find.Width - T.Px(22)), header.Bottom + T.Px(6));
+            inner.Resize += delegate { placeFind(); };
+            header.Resize += delegate { placeFind(); };
             var rightPanel = new Panel { Dock = DockStyle.Fill, BackColor = T.Bg };
             history.Dock = DockStyle.Left;
             history.Visible = false;
@@ -102,6 +116,20 @@ namespace GitPainel
             header.Wrap.On = Ini("quebra") == "1";
             diff.WordWrap = header.Wrap.On;
             header.Wrap.Changed += delegate { diff.WordWrap = header.Wrap.On; };
+            header.Space.On = Ini("espacos") == "ignorar";
+            header.OptionsChanged += delegate { SaveIni(); if (current != null) ShowFile(current, true); };
+            header.NavRequested += dir => diff.NextChange(dir);
+            header.FindRequested += delegate { OpenFind(); };
+            header.SetNav(0, 0);
+            diff.NavChanged += delegate { header.SetNav(diff.CurrentChange, diff.ChangeCount); };
+            diff.FindRequested += delegate { OpenFind(); };
+            diff.ExpandRequested += delegate { if (current != null) { extraContext += 25; ShowFile(current, true); } };
+            diff.ShowAllRequested += delegate { if (current != null) { noLimitKey = current.Key; ShowFile(current, true); } };
+            find.QueryChanged += delegate { diff.SetFind(find.Box.Text); };
+            find.Next += dir => diff.FindNext(dir);
+            find.Closed += delegate { CloseFind(); };
+            diff.FindChanged += delegate { find.SetCount(diff.FindIndex, diff.FindCount, diff.FindQuery.Length > 0); };
+            overview.RepoClicked += r => list.Reveal(r);
 
             foreach (var s in (Ini("meus") ?? "").Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries)) list.Stars.Add(s);
             top.Filter.Selected = Ini("filtro") == "meus" ? 1 : 0;
@@ -143,19 +171,25 @@ namespace GitPainel
             poll.Start();
             SetupWatcher();
 
+            ShowNothing(); // começa pelo resumo dos repositórios
             RestoreWindow();
             Application.AddMessageFilter(this);
         }
 
         static Icon MakeIcon()
         {
-            var bmp = new Bitmap(64, 64);
-            using (var g = Graphics.FromImage(bmp))
+            using (var bmp = new Bitmap(64, 64))
             {
-                g.Clear(Color.Transparent);
-                T.DrawLogo(g, new RectangleF(2, 2, 60, 60));
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Transparent);
+                    T.DrawLogo(g, new RectangleF(2, 2, 60, 60));
+                }
+                // o ícone vira uma cópia gerenciada e o HICON temporário é liberado
+                IntPtr h = bmp.GetHicon();
+                try { using (var tmp = System.Drawing.Icon.FromHandle(h)) return (Icon)tmp.Clone(); }
+                finally { Native.DestroyIcon(h); }
             }
-            return System.Drawing.Icon.FromHandle(bmp.GetHicon());
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -220,11 +254,75 @@ namespace GitPainel
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
+            bool inDiff = diff.Focused || find.ContainsFocus || header.ContainsFocus;
             if (e.KeyCode == Keys.F5) { DoRefresh(); e.Handled = true; }
+            else if (e.KeyCode == Keys.F1) { ShowShortcuts(); e.Handled = true; }
             else if (e.Alt && e.KeyCode == Keys.Z) { header.Wrap.On = !header.Wrap.On; e.Handled = true; e.SuppressKeyPress = true; }
-            else if (e.Control && e.KeyCode == Keys.F) { search.Box.Focus(); search.Box.SelectAll(); e.Handled = true; e.SuppressKeyPress = true; }
+            // navegação entre alterações: F7 / Shift+F7 (como no VS Code) ou Alt+↓ / Alt+↑
+            else if (e.KeyCode == Keys.F7 || (e.Alt && (e.KeyCode == Keys.Down || e.KeyCode == Keys.Up)))
+            {
+                diff.NextChange(e.Shift || e.KeyCode == Keys.Up ? -1 : 1);
+                e.Handled = true; e.SuppressKeyPress = true;
+            }
+            else if (e.KeyCode == Keys.F3 && find.Visible) { diff.FindNext(e.Shift ? -1 : 1); e.Handled = true; }
+            // Ctrl+F: no diff (com foco nele) busca no texto; no resto, busca arquivos
+            else if (e.Control && e.KeyCode == Keys.F)
+            {
+                if (inDiff && current != null) OpenFind();
+                else { search.Box.Focus(); search.Box.SelectAll(); }
+                e.Handled = true; e.SuppressKeyPress = true;
+            }
+            else if (e.KeyCode == Keys.Escape && find.Visible && inDiff) { CloseFind(); e.Handled = true; e.SuppressKeyPress = true; }
             else if (e.Control && e.KeyCode == Keys.O) { PickFolder(); e.Handled = true; }
             base.OnKeyDown(e);
+        }
+
+        void OpenFind()
+        {
+            if (current == null || diff.Data.Title != null) return;
+            // texto selecionado (uma linha) vira a busca, como nos editores
+            string sel = diff.SelectedText();
+            if (sel.Length > 0 && sel.Length < 120 && sel.IndexOf('\n') < 0) find.Box.Text = sel;
+            find.Visible = true;
+            find.BringToFront();
+            find.Box.Focus();
+            find.Box.SelectAll();
+            diff.SetFind(find.Box.Text);
+        }
+
+        void CloseFind()
+        {
+            if (!find.Visible) return;
+            find.Visible = false;
+            diff.SetFind("");
+            diff.Focus();
+        }
+
+        void ShowShortcuts()
+        {
+            const string text =
+                "Lista de arquivos\n" +
+                "  ↑ / ↓                 mover entre repositórios, módulos, commits e arquivos\n" +
+                "  ← / →                 recolher / expandir (← num arquivo sobe para o grupo)\n" +
+                "  Enter                 abrir o arquivo no VS Code (ou expandir o grupo)\n" +
+                "  Espaço                marcar / desmarcar para o commit\n" +
+                "  Ctrl+↓ / Ctrl+↑       expandir / recolher tudo\n" +
+                "  Ctrl+C                copiar o caminho do arquivo\n" +
+                "\n" +
+                "Diff\n" +
+                "  F7 / Shift+F7         próxima / anterior alteração (também Alt+↓ / Alt+↑)\n" +
+                "  Ctrl+F                buscar no diff (com o foco no diff)\n" +
+                "  Enter / Shift+Enter   próxima / anterior ocorrência da busca (ou F3)\n" +
+                "  Alt+Z                 quebrar linhas\n" +
+                "  Ctrl+C / Ctrl+A       copiar / selecionar tudo\n" +
+                "\n" +
+                "Geral\n" +
+                "  Ctrl+F                buscar arquivo (com o foco na lista)\n" +
+                "  Ctrl+Enter            fazer o commit\n" +
+                "  F5                    atualizar\n" +
+                "  Ctrl+O                trocar de pasta\n" +
+                "  F1                    esta lista";
+            using (var d = new MessageDialog("Atalhos do teclado", null, text, null, T.Purple, "Cancelar", 520)) d.ShowDialog(this);
         }
 
         public bool PreFilterMessage(ref Message m)
@@ -288,12 +386,19 @@ namespace GitPainel
             DoRefresh();
         }
 
+        // sem arquivo escolhido: o lugar do diff mostra o resumo dos repositórios
         void ShowNothing()
         {
             current = null;
+            diffReq++;
+            diff.Loading = false;
             header.Set(null, null);
             header.SetNote(null);
+            CloseFind();
             diff.SetData(DiffData.Msg(G.Doc, "Selecione um arquivo", "Escolha um arquivo alterado na lista ao lado para ver o diff."), false);
+            overview.Visible = true;
+            overview.BringToFront();
+            find.BringToFront();
         }
 
         void DoRefresh()
@@ -344,6 +449,8 @@ namespace GitPainel
             }
             repos = result;
             history.RepoRefreshed(repos);
+            overview.Empty = "Nenhum repositório Git encontrado nesta pasta";
+            overview.SetRepos(repos);
 
             string key = list.Selected != null ? list.Selected.Key : null;
             list.EmptyText = "Nenhum repositório Git encontrado nesta pasta";
@@ -391,21 +498,44 @@ namespace GitPainel
         void ShowFile(FileChange f, bool keepScroll)
         {
             int req = ++diffReq;
-            RunAsync(() => Git.LoadDiff(f), d =>
+            bool same = current != null && current.Key == f.Key;
+            // outro arquivo: o contexto extra e o "mostrar tudo" valem só para o arquivo em que foram pedidos
+            if (!same) { extraContext = 0; noLimitKey = null; }
+            var opt = new Git.DiffOptions
+            {
+                Context = header.Full.On ? 99999 : 3 + extraContext,
+                IgnoreSpace = header.Space.On,
+                NoLimit = noLimitKey == f.Key
+            };
+            if (overview.Visible) { overview.Visible = false; }
+            diff.Loading = true;
+            RunAsync(() => Git.LoadDiff(f, opt), d =>
             {
                 if (req != diffReq) return;
+                diff.Loading = false;
+                bool unchanged = same && keepScroll && d.Title == null && diff.Data.Title == null && d.Raw == diff.Data.Raw && d.Custom == diff.Data.Custom
+                    && d.Truncated == diff.Data.Truncated && d.Lines.Count == diff.Data.Lines.Count;
                 current = f;
-                header.Set(f, d);
-                diff.SetData(d, keepScroll);
-                if (!f.FromHistory) list.ValidatePartial(f, d);
+                header.Set(f, unchanged ? diff.Data : d);
+                // atualização automática sem mudança no texto: mantém seleção, cores e posição
+                if (!unchanged) diff.SetData(d, keepScroll);
+                if (!f.FromHistory && !d.Custom) list.ValidatePartial(f, d);
                 UpdateHunkUi();
-            });
+                header.SetNav(diff.CurrentChange, diff.ChangeCount);
+            }, () => { diff.Loading = false; });
         }
 
         // caixas nos trechos do diff + aviso no cabeçalho
         void UpdateHunkUi()
         {
             var d = diff.Data;
+            if (current != null && current.HunkSelectable && d.Title == null && d.Custom)
+            {
+                // diff com contexto extra ou ignorando espaços não serve para escolher trechos
+                diff.SetHunks(false, null);
+                header.SetNote(header.Space.On ? "ignorando espaços: commit por trecho desligado" : "contexto ampliado: commit por trecho desligado");
+                return;
+            }
             if (current == null || !current.HunkSelectable || d.Title != null || d.HunkCount == 0)
             {
                 diff.SetHunks(false, null);
@@ -428,16 +558,15 @@ namespace GitPainel
             var repo = list.CheckedRepo;
             if (repo == null)
             {
-                if (commit.Visible && !commit.Busy) commit.Visible = false;
+                if (commit.Visible && !commit.Busy) Slide(commit, false, commit.PreferredHeight, false);
                 return;
             }
             Git.RepoStyle st;
             bool known = styles.TryGetValue(repo.FullPath, out st);
             var files = list.CheckedFiles;
             commit.SetSelection(repo, files, files.Count(f => list.Partial.ContainsKey(f.Key)), st);
-            commit.Height = commit.PreferredHeight;
             // não rouba o foco: quem marca arquivos pelo teclado continua navegando na lista
-            if (!commit.Visible) commit.Visible = true;
+            Slide(commit, false, commit.PreferredHeight, true);
             if (!known)
             {
                 styles[repo.FullPath] = null;
@@ -507,16 +636,63 @@ namespace GitPainel
             }
         }
 
+        // painel que entra/sai deslizando (~150 ms) em vez de aparecer de uma vez e empurrar o resto
+        // Live: altura desejada lida a cada passo (o painel de commit cresce ao abrir a descrição no meio da animação)
+        class SlideState { public Timer T; public int Target, Full; public bool Hide, Horizontal; public Func<int> Live; }
+        readonly Dictionary<Control, SlideState> slides = new Dictionary<Control, SlideState>();
+
+        void Slide(Control c, bool horizontal, int size, bool show)
+        {
+            SlideState s;
+            if (!slides.TryGetValue(c, out s))
+            {
+                s = new SlideState { T = new Timer { Interval = 15 }, Horizontal = horizontal };
+                var st = s;
+                if (c == commit) s.Live = () => commit.PreferredHeight;
+                s.T.Tick += delegate
+                {
+                    if (!st.Hide && st.Live != null) st.Target = st.Live();
+                    int cur = st.Horizontal ? c.Width : c.Height;
+                    int next = cur + (int)Math.Round((st.Target - cur) * 0.4f);
+                    if (next == cur) next = st.Target;
+                    if (Math.Abs(st.Target - next) <= 1) next = st.Target;
+                    if (st.Horizontal) c.Width = next; else c.Height = next;
+                    if (next != st.Target) return;
+                    st.T.Stop();
+                    if (st.Hide) { c.Visible = false; if (st.Horizontal) c.Width = st.Full; else c.Height = st.Full; }
+                };
+                slides[c] = s;
+            }
+            if (show)
+            {
+                s.Full = size;
+                s.Hide = false;
+                s.Target = size;
+                if (!c.Visible) { if (horizontal) c.Width = 0; else c.Height = 0; c.Visible = true; }
+                else if ((horizontal ? c.Width : c.Height) == size && !s.T.Enabled) return;
+            }
+            else
+            {
+                if (!c.Visible) return;
+                s.Full = horizontal ? Math.Max(c.Width, s.Full) : Math.Max(c.Height, s.Full);
+                s.Hide = true;
+                s.Target = 0;
+            }
+            s.T.Start();
+        }
+
+        bool Hiding(Control c) { SlideState s; return slides.TryGetValue(c, out s) && s.Hide && s.T.Enabled; }
+
         void OpenHistory(RepoInfo repo, string path)
         {
-            history.Visible = true;
+            Slide(history, true, T.Px(380), true);
             history.Open(repo, path);
         }
 
         void CloseHistory()
         {
-            if (!history.Visible) return;
-            history.Visible = false;
+            if (!history.Visible || Hiding(history)) return;
+            Slide(history, true, T.Px(380), false);
             if (current != null && current.FromHistory)
             {
                 if (list.Selected != null) ShowFile(list.Selected, false);
@@ -841,6 +1017,7 @@ namespace GitPainel
                 ini["lateral"] = ((int)Math.Round(leftPane.Width / T.S)).ToString();
                 ini["modo"] = header.Mode.Selected == 1 ? "lado" : "unificado";
                 ini["quebra"] = header.Wrap.On ? "1" : "0";
+                ini["espacos"] = header.Space.On ? "ignorar" : "mostrar";
                 ini["filtro"] = top.Filter.Selected == 1 ? "meus" : "todos";
                 ini["meus"] = string.Join("|", list.Stars.OrderBy(s => s, StringComparer.OrdinalIgnoreCase));
                 ini["janela"] = b.X + "," + b.Y + "," + b.Width + "," + b.Height + "," + (WindowState == FormWindowState.Maximized ? "1" : "0");
@@ -906,8 +1083,8 @@ namespace GitPainel
                 fsHandled = ev;
                 DoRefresh();
             }
-            // rede de segurança caso algum evento se perca
-            else if (WindowState != FormWindowState.Minimized && (DateTime.Now - lastRefresh).TotalSeconds > 30)
+            // rede de segurança caso algum evento se perca: com o watcher ativo, raramente; sem ele, a cada 30 s
+            else if (WindowState != FormWindowState.Minimized && (DateTime.Now - lastRefresh).TotalSeconds > (watcher != null ? 300 : 30))
                 DoRefresh();
             if ((DateTime.Now - lastFetch).TotalMinutes >= 10 && repos.Count > 0) BackgroundFetch();
             if ((DateTime.Now - lastUpdateCheck).TotalHours >= 6 && !updating) CheckUpdate();

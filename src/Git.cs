@@ -19,6 +19,7 @@ namespace GitPainel
         public List<ModuleGroup> Modules = new List<ModuleGroup>();
         public List<CommitInfo> Outgoing = new List<CommitInfo>(); // commits locais ainda não enviados (mais recente primeiro)
         public bool OutgoingMore; // há mais commits a enviar do que os listados
+        public CommitInfo Last;   // último commit do branch (para o painel de resumo)
 
         // repositório sem subprojetos: os arquivos aparecem direto, sem nível de módulo
         public bool Flat { get { return Modules.Count == 0 || (Modules.Count == 1 && Modules[0].Path == ""); } }
@@ -47,6 +48,7 @@ namespace GitPainel
         public char Kind;
         public bool Staged, Untracked;
         public bool Unmerged, Resolved; // em conflito de merge; Resolved = já sem marcadores (falta só concluir)
+        public int Adds = -1, Dels = -1; // linhas adicionadas/removidas (-1 = desconhecido ou binário)
         // preenchidos só para arquivos de um commit do histórico
         public string Hash, Parent, Short, Subject;
 
@@ -78,7 +80,7 @@ namespace GitPainel
         public int Old, New, HunkIdx = -1;
         public string Text, Extra;
         public int[] Wrap;               // inícios de cada pedaço quando a quebra de linha está ligada
-        public int ChgS = -1, ChgE = -1; // trecho que mudou dentro da linha (realce de palavras)
+        public int[] Chg;                // trechos que mudaram dentro da linha: pares (início, fim) — realce de palavras
         public List<int> Tok;            // cores de sintaxe: trincas (início, tamanho, tipo)
     }
 
@@ -91,7 +93,23 @@ namespace GitPainel
         public string Header = "";
         public List<string> HunkRaw = new List<string>();
         public int HunkCount { get { return HunkRaw.Count; } }
-        public string Signature { get { return string.Join("\n", Lines.Where(l => l.K == DiffLine.Hunk).Select(l => l.Text)); } }
+        public bool Custom; // gerado com contexto extra ou ignorando espaços: só para ver, não serve para commit por trecho
+        public int Raw;     // impressão digital do texto do diff: se não mudou, a tela não precisa ser refeita
+        public int Truncated; // > 0: total de linhas; só as primeiras Git.LineLimit estão em Lines
+        // identidade dos trechos: cabeçalhos @@ de todos eles (vem de HunkRaw, que fica completo mesmo com o diff truncado)
+        public string Signature
+        {
+            get
+            {
+                return string.Join("\n", HunkRaw.Select(h =>
+                {
+                    int nl = h.IndexOf('\n');
+                    string first = (nl < 0 ? h : h.Substring(0, nl)).TrimEnd('\r');
+                    int close = first.IndexOf("@@", 2);
+                    return close < 0 ? first : first.Substring(0, close + 2);
+                }));
+            }
+        }
 
         public static DiffData Msg(string glyph, string title, string sub)
         {
@@ -250,7 +268,7 @@ namespace GitPainel
                 var f = new FileChange();
                 f.Repo = r;
                 char t = s[0];
-                if (t == '?') { f.Rel = s.Substring(2); f.Untracked = true; f.Kind = 'U'; }
+                if (t == '?') { f.Rel = s.Substring(2); f.Untracked = true; f.Kind = 'N'; }
                 else if (t == '1') { var p = s.Split(new[] { ' ' }, 9); if (p.Length < 9) continue; f.Rel = p[8]; SetKind(f, p[1]); }
                 else if (t == '2')
                 {
@@ -276,7 +294,14 @@ namespace GitPainel
             else r.Branch = head;
             r.Files.Sort((a, b) => string.Compare(a.Rel, b.Rel, StringComparison.OrdinalIgnoreCase));
             GroupModules(r);
+            LoadStats(r);
             r.Outgoing = Outgoing(r);
+            if (r.Outgoing.Count > 0) r.Last = r.Outgoing[0];
+            else if (r.HasHead)
+            {
+                string lo = Out(dir, "log -1 " + LogFormat);
+                if (lo != null) r.Last = ParseLog(lo, new HashSet<string>()).FirstOrDefault();
+            }
             return r;
         }
 
@@ -301,6 +326,55 @@ namespace GitPainel
                 return Regex.IsMatch(text, @"^<<<<<<< ", RegexOptions.Multiline) && Regex.IsMatch(text, @"^>>>>>>> ", RegexOptions.Multiline);
             }
             catch { return true; }
+        }
+
+        // +N −M de cada arquivo: um único "diff --numstat" por repositório; os novos contam as próprias linhas
+        static void LoadStats(RepoInfo r)
+        {
+            if (r.Files.Count == 0) return;
+            var byPath = new Dictionary<string, FileChange>(StringComparer.Ordinal);
+            foreach (var f in r.Files) byPath[f.Rel] = f;
+            if (r.HasHead && r.Files.Any(f => !f.Untracked))
+            {
+                string o = Out(r.FullPath, "diff --numstat -z HEAD");
+                if (o != null)
+                {
+                    var p = o.Split('\0');
+                    for (int i = 0; i < p.Length; i++)
+                    {
+                        var cols = p[i].Split('\t');
+                        if (cols.Length < 3) continue;
+                        string path = cols[2];
+                        if (path.Length == 0 && i + 2 < p.Length) { path = p[i + 2]; i += 2; } // renomeado: "a\tb\t\0antigo\0novo"
+                        FileChange f;
+                        int a, d;
+                        if (byPath.TryGetValue(path, out f) && int.TryParse(cols[0], out a) && int.TryParse(cols[1], out d)) { f.Adds = a; f.Dels = d; }
+                    }
+                }
+            }
+            int budget = 300; // não lê centenas de arquivos novos a cada atualização
+            foreach (var f in r.Files)
+            {
+                if (!f.Untracked || f.Rel.EndsWith("/") || budget-- <= 0) continue;
+                try
+                {
+                    string full = Path.Combine(r.FullPath, f.Rel.Replace('/', '\\'));
+                    var fi = new FileInfo(full);
+                    if (!fi.Exists || fi.Length > 1024 * 1024) continue;
+                    var bytes = File.ReadAllBytes(full);
+                    int n = 0;
+                    bool bin = false;
+                    for (int i = 0; i < bytes.Length; i++)
+                    {
+                        if (bytes[i] == 0 && i < 8000) { bin = true; break; }
+                        if (bytes[i] == '\n') n++;
+                    }
+                    if (bin) continue;
+                    if (bytes.Length > 0 && bytes[bytes.Length - 1] != '\n') n++;
+                    f.Adds = n; f.Dels = 0;
+                }
+                catch { }
+            }
         }
 
         static void SetKind(FileChange f, string xy)
@@ -372,9 +446,35 @@ namespace GitPainel
 
         // ---------------------------------------------------------- diff
 
-        public static DiffData LoadDiff(FileChange f)
+        // opções de exibição: Context = linhas de contexto (3 = padrão do git), IgnoreSpace = ignora mudanças só de espaço
+        public class DiffOptions
         {
-            if (f.FromHistory) return CommitDiff(f);
+            public int Context = 3;
+            public bool IgnoreSpace, NoLimit;
+            public bool IsDefault { get { return Context == 3 && !IgnoreSpace; } }
+            public string Args { get { return (Context != 3 ? " -U" + Context : "") + (IgnoreSpace ? " -w" : ""); } }
+        }
+
+        public const int LineLimit = 20000;
+
+        public static DiffData LoadDiff(FileChange f) { return LoadDiff(f, null); }
+
+        public static DiffData LoadDiff(FileChange f, DiffOptions opt)
+        {
+            var d = LoadDiffCore(f, opt == null ? "" : opt.Args);
+            if (d.Title == null && opt != null && !opt.IsDefault) d.Custom = true;
+            // diff gigante: mostra o começo (o resto sob pedido); os trechos brutos continuam completos para o commit
+            if (d.Title == null && (opt == null || !opt.NoLimit) && d.Lines.Count > LineLimit)
+            {
+                d.Truncated = d.Lines.Count(l => l.K != DiffLine.Hunk);
+                d.Lines.RemoveRange(LineLimit, d.Lines.Count - LineLimit);
+            }
+            return d;
+        }
+
+        static DiffData LoadDiffCore(FileChange f, string extra)
+        {
+            if (f.FromHistory) return CommitDiff(f, extra);
             var repo = f.Repo;
             string full = Path.Combine(repo.FullPath, f.Rel.TrimEnd('/').Replace('/', '\\'));
             string args;
@@ -388,22 +488,22 @@ namespace GitPainel
                         return DiffData.Msg(G.Info, "Arquivo grande demais", "O arquivo tem mais de 2 MB, então o diff não é exibido.");
                 }
                 catch { }
-                args = "diff --no-index --no-color --no-ext-diff -- /dev/null " + Q(f.Rel);
+                args = "diff --no-index --no-color --no-ext-diff" + extra + " -- /dev/null " + Q(f.Rel);
             }
             else if (repo.HasHead)
                 // --literal-pathspecs: caminhos como app/[id]/page.tsx não viram curinga
-                args = "--literal-pathspecs diff --no-color --no-ext-diff -M HEAD -- " + Q(f.Rel) + (f.Orig != null ? " " + Q(f.Orig) : "");
+                args = "--literal-pathspecs diff --no-color --no-ext-diff -M" + extra + " HEAD -- " + Q(f.Rel) + (f.Orig != null ? " " + Q(f.Orig) : "");
             else
-                args = "--literal-pathspecs diff --no-color --no-ext-diff --cached -- " + Q(f.Rel);
+                args = "--literal-pathspecs diff --no-color --no-ext-diff --cached" + extra + " -- " + Q(f.Rel);
             return RunDiff(repo.FullPath, args, f.Rel);
         }
 
-        static DiffData CommitDiff(FileChange f)
+        static DiffData CommitDiff(FileChange f, string extra)
         {
             string paths = Q(f.Rel) + (f.Orig != null ? " " + Q(f.Orig) : "");
             string args = f.Parent != null
-                ? "--literal-pathspecs diff --no-color --no-ext-diff -M " + f.Parent + " " + f.Hash + " -- " + paths
-                : "--literal-pathspecs show --format= --no-color --no-ext-diff -M " + f.Hash + " -- " + paths;
+                ? "--literal-pathspecs diff --no-color --no-ext-diff -M" + extra + " " + f.Parent + " " + f.Hash + " -- " + paths
+                : "--literal-pathspecs show --format= --no-color --no-ext-diff -M" + extra + " " + f.Hash + " -- " + paths;
             return RunDiff(f.Repo.FullPath, args, f.Rel);
         }
 
@@ -418,8 +518,11 @@ namespace GitPainel
                 return DiffData.Msg(G.Doc, "Arquivo binário", "Não há diff de texto para mostrar.");
             var d = Parse(o);
             if (d.Lines.Count == 0)
-                return DiffData.Msg(G.Check, "Sem diferenças de conteúdo", "A mudança é só de permissão, fim de linha ou o arquivo está vazio.");
+                return DiffData.Msg(G.Check, "Sem diferenças de conteúdo", args.Contains(" -w")
+                    ? "A mudança é só de espaços em branco (que estão sendo ignorados)."
+                    : "A mudança é só de permissão, fim de linha ou o arquivo está vazio.");
             d.Lang = Syntax.LangOf(rel);
+            d.Raw = o.GetHashCode() ^ o.Length;
             return d;
         }
 

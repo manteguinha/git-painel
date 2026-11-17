@@ -10,8 +10,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("Git Painel")]
 [assembly: System.Reflection.AssemblyProduct("Git Painel")]
 // versão do app: suba aqui a cada release (a tag no GitHub deve ser v + este número)
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
 
 namespace GitPainel
 {
@@ -45,6 +45,14 @@ namespace GitPainel
         public static readonly Color Yellow = Hex(0xF1FA8C);
         public static readonly Color Field = Mix(Panel, Border, 0.7f); // fundo das caixas de texto
 
+        // tons semânticos: todo controle usa estes, para hover/seleção/guia terem a mesma cara em todo lugar
+        public static readonly Color Hover = Mix(Panel, Line, 0.45f);
+        public static readonly Color HoverSoft = Mix(Panel, Line, 0.35f);
+        public static readonly Color Selected = Line;
+        public static readonly Color SelectedBlur = Mix(Panel, Line, 0.7f); // seleção com a lista sem foco
+        public static readonly Color Guide = Mix(Panel, Line, 0.7f);
+        public static readonly Color TextSoft = Mix(Comment, Fg, 0.45f);
+
         public static float S = 1f;
         public static Font Ui, UiBold, UiStrike, Small, SmallBold, Mono, MonoSmall, Icon, IconSmall, IconBig;
 
@@ -60,7 +68,7 @@ namespace GitPainel
             if (UiBold.Name != "Segoe UI Semibold") UiBold = new Font(Ui, FontStyle.Bold);
             UiStrike = new Font(Ui, FontStyle.Strikeout);
             Small = MakeFont(8.75f, FontStyle.Regular, "Segoe UI");
-            SmallBold = MakeFont(8.25f, FontStyle.Regular, "Segoe UI Semibold");
+            SmallBold = MakeFont(8.75f, FontStyle.Regular, "Segoe UI Semibold");
             if (SmallBold.Name != "Segoe UI Semibold") SmallBold = new Font(Small, FontStyle.Bold);
             Mono = MakeFont(10f, FontStyle.Regular, "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas");
             MonoSmall = MakeFont(8.5f, FontStyle.Regular, Mono.Name);
@@ -105,12 +113,39 @@ namespace GitPainel
             return p;
         }
 
+        // ---- cache de pincéis e canetas: a pintura usa poucas cores, mas chamava new SolidBrush a cada retângulo
+        static readonly System.Collections.Generic.Dictionary<int, SolidBrush> brushes = new System.Collections.Generic.Dictionary<int, SolidBrush>();
+        static readonly System.Collections.Generic.Dictionary<long, Pen> pens = new System.Collections.Generic.Dictionary<long, Pen>();
+
+        public static SolidBrush Brush(Color c)
+        {
+            int k = c.ToArgb();
+            SolidBrush b;
+            if (!brushes.TryGetValue(k, out b))
+            {
+                if (brushes.Count > 512) { foreach (var x in brushes.Values) x.Dispose(); brushes.Clear(); }
+                brushes[k] = b = new SolidBrush(c);
+            }
+            return b;
+        }
+
+        public static Pen PenOf(Color c, float width)
+        {
+            long k = ((long)c.ToArgb() << 16) ^ (long)(width * 100);
+            Pen p;
+            if (!pens.TryGetValue(k, out p))
+            {
+                if (pens.Count > 256) { foreach (var x in pens.Values) x.Dispose(); pens.Clear(); }
+                pens[k] = p = new Pen(c, width);
+            }
+            return p;
+        }
+
         public static void FillRound(Graphics g, Color c, RectangleF r, float rad)
         {
             var old = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var b = new SolidBrush(c))
-            using (var p = Round(r, rad)) g.FillPath(b, p);
+            using (var p = Round(r, rad)) g.FillPath(Brush(c), p);
             g.SmoothingMode = old;
         }
 
@@ -118,21 +153,20 @@ namespace GitPainel
         {
             var old = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var pen = new Pen(c, width))
-            using (var p = Round(r, rad)) g.DrawPath(pen, p);
+            using (var p = Round(r, rad)) g.DrawPath(PenOf(c, width), p);
             g.SmoothingMode = old;
         }
 
         public static void Fill(Graphics g, Color c, Rectangle r)
         {
-            using (var b = new SolidBrush(c)) g.FillRectangle(b, r);
+            g.FillRectangle(Brush(c), r);
         }
 
         public static void Dot(Graphics g, Color c, float x, float y, float d)
         {
             var old = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var b = new SolidBrush(c)) g.FillEllipse(b, x, y, d, d);
+            g.FillEllipse(Brush(c), x, y, d, d);
             g.SmoothingMode = old;
         }
 
@@ -142,11 +176,46 @@ namespace GitPainel
             TextRenderer.DrawText(g, s, f, r, c, BaseFlags | extra);
         }
 
+        // medir texto é caro (GDI) e as listas medem os mesmos rótulos a cada pintura
+        static readonly System.Collections.Generic.Dictionary<string, int> measures = new System.Collections.Generic.Dictionary<string, int>();
+        // Font.GetHashCode ignora o nome da fonte (Segoe UI e Segoe UI Semibold colidiriam): cada fonte ganha um id próprio
+        static readonly System.Collections.Generic.Dictionary<Font, int> fontIds = new System.Collections.Generic.Dictionary<Font, int>();
+
         public static int Measure(Graphics g, string s, Font f)
         {
             if (string.IsNullOrEmpty(s)) return 0;
-            return TextRenderer.MeasureText(g, s, f, new Size(int.MaxValue, int.MaxValue),
+            int fid;
+            if (!fontIds.TryGetValue(f, out fid)) fontIds[f] = fid = fontIds.Count;
+            string k = fid.ToString() + "\u0001" + s;
+            int w;
+            if (measures.TryGetValue(k, out w)) return w;
+            if (measures.Count > 6000) measures.Clear();
+            w = TextRenderer.MeasureText(g, s, f, new Size(int.MaxValue, int.MaxValue),
                 TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width;
+            measures[k] = w;
+            return w;
+        }
+
+        // fundo de linha de lista: o mesmo em todas as listas (hover suave, selecionado com barra de destaque)
+        public static void RowBackground(Graphics g, Rectangle rect, float hot, bool sel, bool focused)
+        {
+            if (sel)
+            {
+                FillRound(g, focused ? Selected : SelectedBlur, rect, Px(6));
+                FillRound(g, focused ? Purple : Mix(Purple, Panel, 0.45f), new RectangleF(rect.X, rect.Y + Px(7), Px(3), rect.Height - Px(14)), Px(1.5f));
+            }
+            else if (hot > 0.01f) FillRound(g, Mix(Panel, Hover, hot), rect, Px(6));
+        }
+
+        // contador arredondado (ex.: nº de arquivos); devolve a largura usada
+        public static int Badge(Graphics g, string text, Font f, int right, int cy, Color back, Color fore)
+        {
+            int h = Px(18);
+            int w = Math.Max(Px(24), Measure(g, text, f) + Px(12));
+            var r = new Rectangle(right - w, cy - h / 2, w, h);
+            FillRound(g, back, r, h / 2f);
+            Text(g, text, f, fore, r, TextFormatFlags.HorizontalCenter);
+            return w;
         }
 
         // indicador de carregamento: arco girando sobre um anel apagado
@@ -155,9 +224,35 @@ namespace GitPainel
             float a = (Environment.TickCount % 800) / 800f * 360f;
             var old = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var ring = new Pen(A(c, 55), width)) g.DrawEllipse(ring, r);
+            g.DrawEllipse(PenOf(A(c, 55), width), r);
             using (var arc = new Pen(c, width) { StartCap = LineCap.Round, EndCap = LineCap.Round }) g.DrawArc(arc, r, a, 110);
             g.SmoothingMode = old;
+        }
+
+        // ícone e cor por tipo de arquivo (glifos Segoe Fluent)
+        public static void FileIcon(string name, out string glyph, out Color color)
+        {
+            string ext = "";
+            int dot = name.LastIndexOf('.');
+            if (dot >= 0) ext = name.Substring(dot + 1).ToLowerInvariant();
+            glyph = G.Doc;
+            switch (ext)
+            {
+                case "ts": case "tsx": case "mts": case "cts": color = Hex(0x6CB6FF); glyph = G.Code; break;
+                case "js": case "jsx": case "mjs": case "cjs": color = Yellow; glyph = G.Code; break;
+                case "py": color = Hex(0x7AB8F5); glyph = G.Code; break;
+                case "cs": case "java": case "kt": case "go": case "rs": case "php": case "rb": color = Purple; glyph = G.Code; break;
+                case "json": case "yml": case "yaml": case "toml": case "xml": case "ini": case "env": case "config": color = Orange; glyph = G.Settings; break;
+                case "sql": color = Cyan; glyph = G.Database; break;
+                case "css": case "scss": case "less": color = Pink; glyph = G.Code; break;
+                case "html": case "htm": color = Hex(0xFF9E64); glyph = G.Code; break;
+                case "md": case "txt": case "rst": color = TextSoft; glyph = G.Note; break;
+                case "png": case "jpg": case "jpeg": case "gif": case "svg": case "ico": case "webp": case "bmp": color = Pink; glyph = G.Image; break;
+                case "bat": case "cmd": case "ps1": case "sh": color = Green; glyph = G.Terminal; break;
+                case "lock": color = Comment; glyph = G.Lock; break;
+                default: color = Comment; break;
+            }
+            if (name.EndsWith("/")) { glyph = G.FolderClosed; color = Cyan; }
         }
 
         // 0..1 oscilando suavemente (pulso de "trabalhando")
@@ -187,7 +282,7 @@ namespace GitPainel
         {
             switch (k)
             {
-                case 'A': case 'U': return Green;
+                case 'A': case 'N': return Green;
                 case 'D': case '!': return Red;
                 case 'R': return Cyan;
                 default: return Orange;
@@ -199,11 +294,25 @@ namespace GitPainel
             switch (k)
             {
                 case 'A': return "ADICIONADO";
-                case 'U': return "NÃO RASTREADO";
+                case 'N': return "NOVO";
                 case 'D': return "EXCLUÍDO";
                 case 'R': return "RENOMEADO";
                 case '!': return "CONFLITO";
                 default: return "MODIFICADO";
+            }
+        }
+
+        // explicação para o tooltip da letra de status
+        public static string StatusHint(char k)
+        {
+            switch (k)
+            {
+                case 'A': return "Adicionado";
+                case 'N': return "Novo (ainda não rastreado pelo Git)";
+                case 'D': return "Excluído";
+                case 'R': return "Renomeado";
+                case '!': return "Em conflito de merge";
+                default: return "Modificado";
             }
         }
 
@@ -237,7 +346,10 @@ namespace GitPainel
             Doc = "", Check = "", Info = "", Warn = "", Search = "",
             FolderClosed = "", Star = "", StarFill = "", History = "",
             Pull = "", Push = "", Undo = "", Close = "",
-            Note = "\uE70B", Code = "\uE943", Copy = "\uE8C8", More = "\uE712", Up = "\uE70E";
+            Note = "\uE70B", Code = "\uE943", Copy = "\uE8C8", More = "\uE712", Up = "\uE70E",
+            Settings = "\uE713", Database = "\uE1D3", Image = "\uEB9F", Terminal = "\uE756", Lock = "\uE72E",
+            ArrowUp = "\uE74A", ArrowDown = "\uE74B", Whitespace = "\uE75D", FullFile = "\uE8A5", Keyboard = "\uE765",
+            Expand = "\uE740", Clock = "\uE823", Branch = "\uE8AB";
     }
 
     static class Native
@@ -246,6 +358,7 @@ namespace GitPainel
         [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
         [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point p);
+        [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr h, string app, string idList);
 
@@ -285,5 +398,18 @@ namespace GitPainel
         }
 
         static int ColorRef(Color c) { return c.R | (c.G << 8) | (c.B << 16); }
+
+        // Windows 11: cantos arredondados (2 = normal, 3 = pequeno) e borda na cor do tema
+        public static void RoundCorners(IntPtr h, bool small, Color border)
+        {
+            try
+            {
+                int v = small ? 3 : 2;
+                DwmSetWindowAttribute(h, 33, ref v, 4);
+                int c = ColorRef(border);
+                DwmSetWindowAttribute(h, 34, ref c, 4);
+            }
+            catch { }
+        }
     }
 }

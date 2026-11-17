@@ -59,3 +59,29 @@ A evolução do Git Painel, na ordem em que as funcionalidades foram criadas.
 - Cada commit abre para mostrar os arquivos; clicar num arquivo mostra o diff daquele commit.
 - Botão direito no commit: copiar hash ou mensagem, desfazer (o mais recente).
 - Datas dos commits em português ("há 5 min", "ontem, 14:30").
+
+## 11. Interface refinada e mais leve (v1.4.0)
+- **Visão geral:** sem arquivo aberto, um cartão por repositório com branch, alterações, a enviar/receber e último commit; clicar leva ao repositório.
+- **Lista:** ícone por tipo de arquivo, `+N −M` em cada arquivo, status "N" para arquivo novo (antes "U", que no Git significa conflito), hover suave e dicas em ícones, pílulas, estrelas e nomes cortados.
+- **Teclado:** ↑ ↓ percorrem todas as linhas, ← → recolhem e expandem, Enter abre no VS Code, Espaço marca arquivo ou módulo; F1 mostra todos os atalhos.
+- **Diff:**
+  - navegação entre alterações (F7 / Shift+F7, Alt+↓ / Alt+↑) com "2 de 5" no cabeçalho;
+  - busca no diff com contador;
+  - régua lateral com as alterações e as ocorrências;
+  - "N linhas ocultas" para ver mais contexto e opção de arquivo inteiro;
+  - ignorar mudanças só de espaço;
+  - realce de palavras por token, com vários trechos por linha;
+  - indicador de carregamento;
+  - diffs gigantes mostram 20 mil linhas, com "Mostrar tudo".
+- **Acabamento:**
+  - cabeçalhos alinhados;
+  - painéis de commit e histórico que deslizam;
+  - diálogos sem moldura nativa, com cantos arredondados;
+  - menus arredondados (Windows 11);
+  - foco visível ao navegar com Tab.
+- **Desempenho:**
+  - pincéis e medidas de texto em cache;
+  - pintura e clique por busca binária;
+  - o diff não é refeito quando nada mudou, mantendo a seleção e a posição;
+  - o redesenho com quebra de linha espera o divisor parar;
+  - atualização periódica a cada 5 minutos com o monitor de arquivos ativo (antes 30 s).
